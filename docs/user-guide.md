@@ -285,9 +285,9 @@ If the console is extremely busy, the app batches visible output so the UI remai
 
 Start and Restart run preflight checks first. Blocking errors prevent launch; warnings remain visible for review. Port checks are skipped during Restart because the current server still owns its ports. You can also run checks from **FXServer > Diagnostics**, which lists missing dependencies, duplicate resources, configuration references, and RCON warnings. Dynamically generated Lua configuration cannot be fully verified without executing it, so review those warnings manually.
 
-Preflight follows resource directory symlinks and junctions, including linked groups and a linked resources root. It reads manifests and explicit `exec @resource/file.cfg` includes without changing their targets. Cycles and scan limits produce warnings. File-changing workflows retain their separate link protections.
+Preflight scans both the profile's `resources` folder and the selected artifact's `citizen/system_resources` folder, including bundled resources such as `chat`. It follows resource directory symlinks and junctions, including linked groups and a linked resources root, and reads manifests and explicit `exec @resource/file.cfg` includes without changing their targets. Cycles, scan limits, and ambiguous copies across the two roots produce warnings. Artifact resources are read-only diagnostic evidence; file-changing workflows retain their separate link protections.
 
-When stopped, **Force start** offers a confirmed, one-time attempt without preflight. Use it after reviewing a false-positive check or when diagnostics cannot complete. It does not repair missing files, free occupied ports, bypass executable/process safeguards, or permanently disable checks. Overrides are recorded in Application Logs.
+When stopped, **Force start** offers a confirmed, one-time attempt without preflight. When running, **Force restart** offers the same override after warning that players will be disconnected. Use these after reviewing a false-positive check or when diagnostics cannot complete. They do not repair missing files, free occupied ports, bypass executable/process safeguards, or permanently disable checks. Cancelling the confirmation leaves the server alone. Overrides are recorded in Application Logs.
 
 ## Workspaces And Tasks
 
@@ -354,7 +354,11 @@ Cleanup drops only the exact generated target with its matching ownership marker
 
 ## Health And Recovery
 
-Open **FXServer > Health & Recovery** to enable CPU, RAM, or free-disk alerts. Monitoring runs in the backend at five-second intervals, including while the window is hidden. Thresholds must stay exceeded for the configured sustained period; cooldowns prevent repeated notifications. Alerts appear in Application Logs and in dismissible notifications.
+Open **FXServer > Health & Recovery** for live CPU, RAM, and free-disk readings. Passive monitoring runs in the backend at five-second intervals, including while the window is hidden, without enabling alerts or recovery. CPU and RAM readings apply to the server managed by this app. The page distinguishes waiting for the first sample, a stopped server, and unavailable or stale measurements.
+
+The disk reading uses the selected local folder; leaving it blank uses the app folder. The sampled folder is shown beside the readings. Choose a folder on the server's drive when it differs from the app's drive. Network paths, device paths, and linked disk folders are not followed.
+
+Health alerts are opt-in. Thresholds must stay exceeded for the configured sustained period; cooldowns prevent repeated notifications. Alerts appear in Application Logs and in dismissible notifications. Setting the disk threshold to zero disables its alerts, not the disk reading.
 
 Automatic crash recovery is off by default and must be explicitly enabled for the current session. It only restarts a server launched successfully by this app. It waits between attempts and allows at most three attempts per ten-minute window. Manual Stop, workspace switching, and Quit disarm recovery. This is not a Windows service or a replacement for an external uptime monitor.
 

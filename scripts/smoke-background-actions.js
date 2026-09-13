@@ -9,7 +9,7 @@ async (page) => {
     localStorage.setItem("installPath", "C:/mock/artifacts");
     const callbacks = new Map();
     const events = new Map();
-    const state = window.testDesktop = { running: false, pending: {}, calls: [], logs: [], unknown: [], counter: 0, blockPreflight: false, preflightError: "" };
+    const state = window.testDesktop = { running: false, pending: {}, calls: [], preflights: [], logs: [], unknown: [], counter: 0, blockPreflight: false, preflightError: "" };
     window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: (name) => events.delete(name) };
     window.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
@@ -29,6 +29,7 @@ async (page) => {
           case "initialize_health_workspace": return;
           case "configure_live_bridge": return { workspaceId: args.target.workspaceId, enabled: false, connected: false, snapshot: null };
           case "run_fxserver_preflight":
+            state.preflights.push(args.request);
             if (state.preflightError) throw new Error(state.preflightError);
             return { checkedAt: Date.now(), blocking: state.blockPreflight, errorCount: state.blockPreflight ? 1 : 0, warningCount: 0, resourceCount: 0, configCount: 0,
               checks: state.blockPreflight ? [{ severity: "error", title: "Configured resource missing", detail: "A fixture resource is missing." }] : [] };
@@ -89,6 +90,10 @@ async (page) => {
   for (const [label, command] of [["Start", "start_fxserver"], ["Restart", "restart_fxserver"], ["Stop", "stop_fxserver"]]) {
     await page.getByRole("button", { name: label, exact: true }).click();
     await waitPending(command);
+    if (label !== "Stop") {
+      const checkPorts = await page.evaluate(() => window.testDesktop.preflights.at(-1).checkPorts);
+      if (checkPorts !== (label === "Start")) throw new Error(`${label}: incorrect occupied-port check`);
+    }
     const started = Date.now();
     await home();
     await db();
@@ -164,6 +169,37 @@ async (page) => {
   await page.getByText("FXServer started with the selected TXHOST environment.", { exact: true }).waitFor();
   await page.waitForFunction(() => window.testDesktop.logs.some((line) => line.includes("user-confirmed preflight override")));
 
+  await page.evaluate(() => { window.testDesktop.preflightError = ""; });
+  const restartsBeforeOverride = await calls("restart_fxserver");
+  await page.getByRole("button", { name: "Restart", exact: true }).click();
+  await page.getByText("Preflight found blocking issues.", { exact: false }).waitFor();
+  if (await calls("restart_fxserver") !== restartsBeforeOverride) throw new Error("A blocked restart stopped the running server");
+  await page.getByRole("button", { name: "Force restart", exact: true }).click();
+  const restartOverride = page.getByRole("dialog", { name: "Restart without preflight?" });
+  await restartOverride.waitFor();
+  await page.setViewportSize({ width: 480, height: 800 });
+  await page.screenshot({ path: "output/playwright/force-restart-confirmation.png", fullPage: true, animations: "disabled" });
+  const restartBounds = await restartOverride.boundingBox();
+  if (!restartBounds || restartBounds.x < 0 || restartBounds.y < 0 || restartBounds.x + restartBounds.width > 480 || restartBounds.y + restartBounds.height > 800) throw new Error("Force restart dialog clips at narrow width");
+  await restartOverride.getByRole("button", { name: "Cancel", exact: true }).click();
+  if (await calls("restart_fxserver") !== restartsBeforeOverride) throw new Error("Cancelling the override restarted FXServer");
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.getByRole("button", { name: "Force restart", exact: true }).click();
+  const checksBeforeRestartOverride = await calls("run_fxserver_preflight");
+  await restartOverride.getByRole("button", { name: "Restart anyway", exact: true }).click();
+  await waitPending("restart_fxserver");
+  if (await calls("run_fxserver_preflight") !== checksBeforeRestartOverride) throw new Error("Confirmed force restart reran preflight");
+  await home();
+  await manage();
+  await assertDisabled("Restart");
+  await assertDisabled("Force restart");
+  await complete("restart_fxserver");
+  await page.getByText("FXServer restarted with the selected TXHOST environment.", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Restart", exact: true }).click();
+  await page.getByText("Preflight found blocking issues.", { exact: false }).waitFor();
+  if (await calls("restart_fxserver") !== restartsBeforeOverride + 1) throw new Error("The preflight override persisted into another restart");
+  await page.waitForFunction(() => window.testDesktop.logs.some((line) => line.includes("Restarting FXServer with a user-confirmed preflight override")));
+
   await db();
   await page.getByPlaceholder("Required root password").fill("mock-only");
   await page.getByRole("button", { name: "Install", exact: true }).click();
@@ -181,5 +217,5 @@ async (page) => {
   const longestTask = await page.evaluate(() => Math.max(0, ...window.uiLongTasks));
   if (longestTask >= 500) throw new Error(`UI stalled for ${longestTask} ms`);
   console.log(`Longest UI task: ${longestTask} ms (500 ms regression ceiling)`);
-  console.log("PASS: start/restart/stop, one-time confirmed preflight override, RCON success/failure, 1000 console entries, MariaDB progress across navigation; no page errors.");
+  console.log("PASS: start/restart/stop, one-time confirmed start/restart preflight overrides, RCON success/failure, 1000 console entries, MariaDB progress across navigation; no page errors.");
 }

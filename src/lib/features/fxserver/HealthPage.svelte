@@ -16,13 +16,16 @@
 	import { Input } from "$lib/components/ui/input/index.js";
 	import { Notice } from "$lib/components/ui/notice/index.js";
 	import { chooseFolder } from "$lib/core/selectFolder";
-	import { clearHealthEvents, configureHealth, defaultHealthConfig, getHealthStatus, type HealthStatus } from "$lib/modules/health";
+	import { clearHealthEvents, configureHealth, defaultHealthConfig, getHealthStatus, healthMetricLabel, healthProcessLabel, healthSampleIsStale, type HealthStatus } from "$lib/modules/health";
 
 	let status = $state<HealthStatus | null>(null);
 	let config = $state({ ...defaultHealthConfig });
 	let loading = $state(false);
 	let saving = $state(false);
 	let error = $state("");
+	let samplingError = $state("");
+	let dismissedSamplingError = $state("");
+	let clockNow = $state(Date.now());
 	let message = $state("");
 	let showSessionNotice = $state(true);
 	let active = false;
@@ -30,6 +33,7 @@
 	let updateRevision = 0;
 	const dirty = $derived(status !== null && JSON.stringify(config) !== JSON.stringify(status.config));
 	const recoveryLabel = $derived(status?.recoveryBlocked ? "Retry limit reached" : status?.recoveryArmed ? "Armed" : "Disarmed");
+	const unavailable = $derived(Boolean(samplingError) || healthSampleIsStale(status?.sample, clockNow));
 
 	function errorMessage(value: unknown) {
 		return value instanceof Error ? value.message : String(value);
@@ -45,9 +49,16 @@
 			if (!active || revision !== updateRevision) return;
 			if (loadConfig || status?.workspaceId !== result.workspaceId) config = { ...result.config };
 			status = result;
+			samplingError = "";
+			dismissedSamplingError = "";
 		} catch (cause) {
-			if (active) error = errorMessage(cause);
+			if (active && revision === updateRevision) {
+				const nextError = errorMessage(cause);
+				if (nextError !== samplingError) dismissedSamplingError = "";
+				samplingError = nextError;
+			}
 		} finally {
+			clockNow = Date.now();
 			requestPending = false;
 			loading = false;
 		}
@@ -63,6 +74,9 @@
 			const result = await configureHealth({ ...config }, status.workspaceId);
 			if (!active) return;
 			status = result;
+			samplingError = "";
+			dismissedSamplingError = "";
+			clockNow = Date.now();
 			config = { ...result.config };
 			message = "Health settings applied for this session.";
 		} catch (cause) {
@@ -90,14 +104,13 @@
 		}
 	}
 
-	function metric(value: number | null | undefined, suffix: string) {
-		return value == null ? "Not sampled" : `${value.toFixed(1)}${suffix}`;
-	}
-
 	onMount(() => {
 		active = true;
 		void refresh(true, true);
-		const timer = setInterval(() => void refresh(), 5000);
+		const timer = setInterval(() => {
+			clockNow = Date.now();
+			void refresh();
+		}, 5000);
 		return () => {
 			active = false;
 			clearInterval(timer);
@@ -117,16 +130,21 @@
 	</header>
 
 	{#if showSessionNotice}
-		<Notice tone="info" title="Session monitoring" message="Monitoring runs while the app is open or in the tray. It is disabled after quitting or switching workspaces. Recovery only applies to servers started by this app; manual stops never trigger it." onDismiss={() => showSessionNotice = false} />
+		<Notice tone="info" title="Session monitoring" message="Passive readings continue while the app is open or in the tray. Alerts and recovery are off by default; switching workspaces resets only those settings, not passive monitoring. Manual stops never trigger recovery." onDismiss={() => showSessionNotice = false} />
 	{/if}
+	{#if samplingError && samplingError !== dismissedSamplingError}<Notice tone="error" title="Health status unavailable" message={samplingError} onDismiss={() => dismissedSamplingError = samplingError} />{/if}
 	{#if error}<Notice tone="error" message={error} onDismiss={() => error = ""} />{/if}
 	{#if message}<Notice tone="success" {message} onDismiss={() => message = ""} />{/if}
 
 	<div class="grid grid-cols-1 gap-4 border-y border-border py-4 sm:grid-cols-3">
-		<div class="flex items-center gap-3"><CpuIcon class="size-5 shrink-0 text-cyan-400" /><div><p class="text-xs text-muted-foreground">FXServer CPU</p><p class="font-mono text-lg tabular-nums">{metric(status?.sample?.cpuPercent, "%")}</p></div></div>
-		<div class="flex items-center gap-3"><MemoryStickIcon class="size-5 shrink-0 text-emerald-400" /><div><p class="text-xs text-muted-foreground">FXServer RAM</p><p class="font-mono text-lg tabular-nums">{metric(status?.sample?.memoryPercent, "%")}</p></div></div>
-		<div class="flex items-center gap-3"><HardDriveIcon class="size-5 shrink-0 text-amber-400" /><div><p class="text-xs text-muted-foreground">Available disk</p><p class="font-mono text-lg tabular-nums">{metric(status?.sample?.freeDiskGb, " GiB")}</p></div></div>
+		<div class="flex min-w-0 items-center gap-3"><CpuIcon class="size-5 shrink-0 text-cyan-400" /><div class="min-w-0"><p class="text-xs text-muted-foreground">FXServer CPU</p><p class="wrap-break-word font-mono text-base tabular-nums">{healthMetricLabel(status?.sample, "cpuPercent", unavailable)}</p></div></div>
+		<div class="flex min-w-0 items-center gap-3"><MemoryStickIcon class="size-5 shrink-0 text-emerald-400" /><div class="min-w-0"><p class="text-xs text-muted-foreground">FXServer RAM</p><p class="wrap-break-word font-mono text-base tabular-nums">{healthMetricLabel(status?.sample, "memoryPercent", unavailable)}</p></div></div>
+		<div class="flex min-w-0 items-center gap-3"><HardDriveIcon class="size-5 shrink-0 text-amber-400" /><div class="min-w-0"><p class="text-xs text-muted-foreground">Available disk</p><p class="wrap-break-word font-mono text-base tabular-nums">{healthMetricLabel(status?.sample, "freeDiskGb", unavailable)}</p></div></div>
 		{#if status?.sample}<p class="text-xs text-muted-foreground sm:col-span-3">Last sampled {new Date(status.sample.timestamp).toLocaleTimeString()}</p>{/if}
+		{#if unavailable && !samplingError}<p class="text-xs text-amber-400 sm:col-span-3">Health sample is out of date.</p>{/if}
+		{#if status?.sample?.diskPath}<p class="min-w-0 break-all text-xs text-muted-foreground sm:col-span-3">Disk folder: {status.sample.diskPath}</p>{/if}
+		{#if status?.sample?.processError}<p class="wrap-break-word text-xs text-amber-400 sm:col-span-3">{status.sample.processError}</p>{/if}
+		{#if status?.sample?.diskError}<p class="wrap-break-word text-xs text-amber-400 sm:col-span-3">{status.sample.diskError}</p>{/if}
 	</div>
 
 	<form onsubmit={save} class="space-y-5">
@@ -137,10 +155,10 @@
 				<div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
 					<div class="space-y-2"><label for="health-cpu" class="text-xs text-muted-foreground">CPU threshold (%)</label><Input id="health-cpu" type="number" min={1} max={100} step={1} required bind:value={config.cpuThresholdPercent} /></div>
 					<div class="space-y-2"><label for="health-memory" class="text-xs text-muted-foreground">RAM threshold (% of physical memory)</label><Input id="health-memory" type="number" min={1} max={100} step={1} required bind:value={config.memoryThresholdPercent} /></div>
-					<div class="space-y-2"><label for="health-disk-minimum" class="text-xs text-muted-foreground">Minimum free disk (GiB, 0 disables)</label><Input id="health-disk-minimum" type="number" min={0} max={1000000} step={0.1} required bind:value={config.minimumFreeDiskGb} /></div>
+					<div class="space-y-2"><label for="health-disk-minimum" class="text-xs text-muted-foreground">Minimum free disk (GiB, 0 disables alerts)</label><Input id="health-disk-minimum" type="number" min={0} max={1000000} step={0.1} required bind:value={config.minimumFreeDiskGb} /></div>
 					<div class="space-y-2"><label for="health-sustain" class="text-xs text-muted-foreground">Sustained period (seconds)</label><Input id="health-sustain" type="number" min={10} max={600} step={5} required bind:value={config.sustainedSeconds} /></div>
 				</div>
-				<div class="space-y-2"><label for="health-disk-path" class="text-xs text-muted-foreground">Disk folder</label><div class="flex gap-2"><Input id="health-disk-path" class="min-w-0 flex-1" bind:value={config.diskPath} required={config.alertsEnabled && config.minimumFreeDiskGb > 0} /><Button variant="outline" size="icon" title="Choose disk folder" aria-label="Choose disk folder" onclick={browse}><FolderOpenIcon /></Button></div></div>
+				<div class="space-y-2"><label for="health-disk-path" class="text-xs text-muted-foreground">Disk folder</label><div class="flex gap-2"><Input id="health-disk-path" class="min-w-0 flex-1" bind:value={config.diskPath} placeholder="Automatic (app folder)" /><Button type="button" variant="outline" size="icon" title="Choose disk folder" aria-label="Choose disk folder" onclick={browse}><FolderOpenIcon /></Button></div></div>
 				<div class="space-y-2"><label for="health-cooldown" class="text-xs text-muted-foreground">Alert cooldown (seconds)</label><Input id="health-cooldown" type="number" min={30} max={3600} step={5} required bind:value={config.alertCooldownSeconds} /></div>
 			</section>
 			<section class="min-w-0 space-y-4 xl:border-l xl:border-border xl:pl-6">
@@ -151,7 +169,7 @@
 					<div class="flex justify-between gap-3 py-3"><dt class="text-muted-foreground">Maximum attempts</dt><dd>3 in 10 minutes</dd></div>
 					<div class="flex justify-between gap-3 py-3"><dt class="text-muted-foreground">Recent attempts</dt><dd class="tabular-nums">{status?.recoveryAttempts ?? 0} / 3</dd></div>
 					<div class="flex justify-between gap-3 py-3"><dt class="text-muted-foreground">Next attempt</dt><dd>{status?.nextRecoverySeconds == null ? "None scheduled" : `In ${status.nextRecoverySeconds}s`}</dd></div>
-					<div class="flex justify-between gap-3 py-3"><dt class="text-muted-foreground">Server process</dt><dd>{status?.sample?.running ? `Running (${status.sample.pid})` : status?.sample ? "Stopped" : "Not sampled"}</dd></div>
+					<div class="flex justify-between gap-3 py-3"><dt class="text-muted-foreground">Server process</dt><dd class="text-right">{healthProcessLabel(status?.sample, unavailable)}</dd></div>
 				</dl>
 			</section>
 		</fieldset>

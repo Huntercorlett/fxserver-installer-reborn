@@ -14,7 +14,7 @@ async (page) => {
     const callbacks = new Map();
     const events = new Map();
     const state = window.managerTest = {
-      running: false, pending: {}, calls: [], unknown: [], logs: [], schedules: [], counter: 0, blocked: false,
+      running: false, pending: {}, calls: [], unknown: [], logs: [], schedules: [], counter: 0, blocked: false, healthSample: null,
       passwords: JSON.parse(sessionStorage.getItem("passwords") || '{"default":"default-secret"}'),
       health: { alertsEnabled: false, recoveryEnabled: false, cpuThresholdPercent: 90, memoryThresholdPercent: 80, minimumFreeDiskGb: 5, diskPath: "", sustainedSeconds: 15, alertCooldownSeconds: 300, recoveryBackoffSeconds: 30 },
     };
@@ -22,6 +22,7 @@ async (page) => {
       { category: "rcon", code: "rcon.missing", severity: "warning", title: "RCON password missing", detail: "Add rcon_password to server.cfg.", resource: null, file: "server.cfg", line: null },
       ...(state.blocked ? [{ category: "paths", code: "artifact.missing", severity: "error", title: "Artifact missing", detail: "Choose an installed artifact.", resource: null, file: null, line: null }] : []),
     ] });
+    const healthStatus = () => ({ workspaceId: state.workspaceId || "default", config: state.health, sample: state.healthSample, events: [], recoveryArmed: false, recoveryBlocked: false, recoveryAttempts: 0, nextRecoverySeconds: null });
     window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
     window.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
@@ -50,8 +51,18 @@ async (page) => {
           case "run_fxserver_preflight": return report();
           case "start_fxserver": return new Promise((resolve) => { state.pending.start = () => { state.running = true; delete state.pending.start; resolve({ pid: 123, artifactPath: args.request.artifactPath, startedAt: String(Math.floor(Date.now() / 1000)) }); }; });
           case "stop_fxserver": state.running = false; return;
-          case "get_health_status": return { workspaceId: state.workspaceId || "default", config: state.health, sample: null, events: [], recoveryArmed: false, recoveryBlocked: false, recoveryAttempts: 0, nextRecoverySeconds: null };
-          case "configure_health": state.health = args.config; return { workspaceId: args.workspaceId, config: state.health, sample: null, events: [], recoveryArmed: false, recoveryBlocked: false, recoveryAttempts: 0, nextRecoverySeconds: null };
+          case "get_health_status":
+            if (state.holdHealthStatus) return new Promise((resolve) => {
+              state.pending.healthStatus = () => { delete state.pending.healthStatus; resolve(healthStatus()); };
+            });
+            return healthStatus();
+          case "configure_health": {
+            const apply = () => { state.health = args.config; state.healthSample = null; return healthStatus(); };
+            if (state.holdHealthConfig) return new Promise((resolve) => {
+              state.pending.healthConfig = () => { delete state.pending.healthConfig; resolve(apply()); };
+            });
+            return apply();
+          }
           case "get_backup_manager": return { schedules: state.schedules.filter((item) => item.config.workspaceId === args.workspaceId), snapshots: [], restoreTests: [], busy: false };
           case "remove_backup_schedule": state.schedules = state.schedules.filter((item) => item.config.id !== args.scheduleId || item.config.workspaceId !== args.workspaceId); return;
           case "preview_diagnostic_export": return { id: "preview", createdAt: Math.floor(Date.now() / 1000), expiresAt: Math.floor(Date.now() / 1000) + 900, entries: [{ name: "manifest.json", content: '{"appVersion":"0.3.2","rcon_password":"[redacted]"}' }], totalBytes: 64 };
@@ -117,7 +128,88 @@ async (page) => {
   await navigate("Health & Recovery", "FXServer");
   await page.getByRole("heading", { name: "Health & Recovery", exact: true }).waitFor();
   if (await page.getByRole("checkbox", { checked: true }).count()) throw new Error("Health automation is on by default");
+  await page.evaluate(() => {
+    window.managerTest.running = true;
+    window.managerTest.healthSample = { timestamp: Date.now(), running: true, pid: 123, cpuPercent: 12.5, memoryPercent: 24, freeDiskGb: 42, diskPath: "C:/mock/artifacts" };
+  });
+  await page.getByText("12.5%", { exact: true }).waitFor();
+  await page.getByText("24.0%", { exact: true }).waitFor();
+  await page.getByText("42.0 GiB", { exact: true }).waitFor();
+  await page.getByText("Running (123)", { exact: true }).waitFor();
+  if (await page.getByRole("checkbox", { checked: true }).count()) throw new Error("Passive readings enabled health automation");
+  if (await page.evaluate(() => window.managerTest.calls.includes("configure_health"))) throw new Error("Viewing readings silently changed health settings");
   await page.screenshot({ path: "output/playwright/health-desktop.png", fullPage: true });
+  await page.setViewportSize({ width: 480, height: 800 });
+  await page.screenshot({ path: "output/playwright/health-narrow.png", fullPage: true });
+  if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) throw new Error("Health readings overflow at narrow width");
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.evaluate(() => { window.managerTest.healthSample = { timestamp: Date.now(), running: true, pid: 123, cpuPercent: null, memoryPercent: null, freeDiskGb: 42, processError: "Mock process metrics unavailable" }; });
+  await page.getByText("Mock process metrics unavailable", { exact: true }).waitFor();
+  if (await page.getByText("Unavailable", { exact: true }).count() !== 2) throw new Error("Missing metrics were not distinguished from a stopped server");
+  await page.getByText("Running (123)", { exact: true }).waitFor();
+  await page.evaluate(() => { window.managerTest.running = false; window.managerTest.healthSample = { timestamp: Date.now(), running: false, pid: null, cpuPercent: null, memoryPercent: null, freeDiskGb: 42 }; });
+  await page.getByText("Stopped", { exact: true }).first().waitFor();
+  if (await page.getByText("12.5%", { exact: true }).count()) throw new Error("Stopped server retained a stale CPU reading");
+
+  const freshHealthSample = () => page.evaluate(() => {
+    window.managerTest.running = true;
+    window.managerTest.healthSample = { timestamp: Date.now(), running: true, pid: 123, cpuPercent: 12.5, memoryPercent: 24, freeDiskGb: 42, diskPath: "C:/mock/artifacts" };
+  });
+  const refreshHealth = page.getByRole("button", { name: "Refresh health status", exact: true });
+  const applyHealth = page.getByRole("button", { name: "Apply Settings", exact: true });
+  for (const pending of ["healthStatus", "healthConfig"]) {
+    await freshHealthSample();
+    await refreshHealth.click();
+    await page.getByText("12.5%", { exact: true }).waitFor();
+    await page.evaluate((pending) => {
+      window.managerTest.holdHealthStatus = pending === "healthStatus";
+      window.managerTest.holdHealthConfig = pending === "healthConfig";
+    }, pending);
+    if (pending === "healthStatus") {
+      await refreshHealth.click();
+    } else {
+      await page.getByRole("checkbox", { name: "Enable health alerts", exact: true }).check();
+      await applyHealth.click();
+    }
+    await page.waitForFunction((pending) => !!window.managerTest.pending[pending], pending);
+    const polls = await page.evaluate(() => window.managerTest.calls.filter((command) => command === "get_health_status").length);
+    await page.getByText("Health sample is out of date.", { exact: true }).waitFor({ timeout: 35_000 });
+    if (await page.getByText("Unavailable", { exact: true }).count() !== 4) throw new Error(`${pending}: stale metrics or process status remained visible`);
+    if (await page.getByText("12.5%", { exact: true }).count()) throw new Error(`${pending}: stale CPU remained visible`);
+    if (await page.evaluate(() => Date.now() - window.managerTest.healthSample.timestamp) <= 20_000) throw new Error("Stale regression did not cross the actual stale window");
+    if (await page.evaluate(() => window.managerTest.calls.filter((command) => command === "get_health_status").length) !== polls) throw new Error(`${pending}: overlapping health polls were issued`);
+    await page.screenshot({ path: `output/playwright/health-pending-${pending}.png`, fullPage: true });
+    await page.evaluate((pending) => {
+      window.managerTest.holdHealthStatus = false;
+      window.managerTest.holdHealthConfig = false;
+      window.managerTest.pending[pending]();
+    }, pending);
+    await freshHealthSample();
+    await refreshHealth.click();
+    await page.getByText("12.5%", { exact: true }).waitFor();
+    if (await page.getByText("Health sample is out of date.", { exact: true }).count()) throw new Error(`${pending}: freshness did not recover after IPC completed`);
+  }
+
+  const vanishedDisk = "C:/mock/vanished-health-folder";
+  await page.getByRole("checkbox", { name: "Enable health alerts", exact: true }).check();
+  await page.getByRole("checkbox", { name: "Restart after an unexpected exit", exact: true }).check();
+  await page.getByRole("textbox", { name: "Disk folder", exact: true }).fill(vanishedDisk);
+  await applyHealth.click();
+  await page.waitForFunction((path) => window.managerTest.health.alertsEnabled && window.managerTest.health.recoveryEnabled && window.managerTest.health.diskPath === path, vanishedDisk);
+  await freshHealthSample();
+  await page.evaluate(() => {
+    Object.assign(window.managerTest.healthSample, { freeDiskGb: null, diskPath: null, diskError: "Mock disk folder disappeared" });
+  });
+  await refreshHealth.click();
+  await page.getByText("Mock disk folder disappeared", { exact: true }).waitFor();
+  await page.getByRole("checkbox", { name: "Enable health alerts", exact: true }).uncheck();
+  await page.getByRole("checkbox", { name: "Restart after an unexpected exit", exact: true }).uncheck();
+  await applyHealth.click();
+  await page.waitForFunction(() => !window.managerTest.health.alertsEnabled && !window.managerTest.health.recoveryEnabled);
+  if (await page.getByRole("textbox", { name: "Disk folder", exact: true }).inputValue() !== vanishedDisk) throw new Error("Opt-out required clearing the unavailable disk folder");
+  if (await page.evaluate(() => window.managerTest.calls.includes("restart_fxserver"))) throw new Error("Health regressions invoked a server restart");
+  await page.screenshot({ path: "output/playwright/health-vanished-disk-optout.png", fullPage: true });
+  await page.evaluate(() => { window.managerTest.running = false; });
   await navigate("Backups & Restore", "MariaDB");
   await page.getByRole("heading", { name: /^(Backups & Restore|Backup Manager)$/ }).waitFor();
   await page.screenshot({ path: "output/playwright/backups-desktop.png", fullPage: true });
@@ -159,5 +251,5 @@ async (page) => {
   const unknown = await page.evaluate(() => window.managerTest.unknown);
   if (unknown.length) throw new Error(`Missing mocks: ${unknown.join(", ")}`);
   await page.evaluate(() => { window.managerTest.completed = true; });
-  console.log("PASS: workspace isolation, running/task switch guards, preflight gate, nonblocking task navigation, health/backup/diagnostics pages, dismissible background failure, narrow layouts.");
+  console.log("PASS: workspace isolation, running/task switch guards, preflight gate, nonblocking task navigation, passive health polling with automation off, unavailable/stopped readings, backup/diagnostics pages, dismissible background failure, narrow layouts.");
 }

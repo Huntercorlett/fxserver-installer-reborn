@@ -13,6 +13,26 @@ pub struct Guidance {
 }
 
 pub(super) fn guidance(check: &DiagnosticCheck, inspection: &Inspection) -> Option<Guidance> {
+    if matches!(
+        check.code.as_str(),
+        "dependency-missing" | "duplicate-resource"
+    ) && check.resource.as_ref().is_some_and(|name| {
+        inspection.resources.iter().any(|resource| {
+            resource.origin == ResourceOrigin::Artifact && resource.name.eq_ignore_ascii_case(name)
+        }) && !inspection.resources.iter().any(|resource| {
+            resource.origin == ResourceOrigin::Data && resource.name.eq_ignore_ascii_case(name)
+        })
+    }) {
+        return Some(Guidance {
+            steps: vec![
+                "Review the bundled resource in citizen/system_resources and the selected artifact version.",
+                "Artifact resources are read-only diagnostic evidence, not profile resource repair or update targets. Review an artifact installation if bundled files are missing or incompatible.",
+            ],
+            page: "artifact-install",
+            label: "Open artifacts",
+            patch_available: false,
+        });
+    }
     let (page, label, steps): (_, _, Vec<_>) = match check.code.as_str() {
         "artifact-missing" => ("artifact-install", "Open artifacts", vec![
             "Choose the existing artifact folder containing FXServer.exe, or review an artifact installation.",
@@ -31,7 +51,15 @@ pub(super) fn guidance(check: &DiagnosticCheck, inspection: &Inspection) -> Opti
             "Plain exec paths resolve from the server data directory; @resource/file paths require an installed resource. Keep includes inside dataPath.",
             "Correct the reference in the editor and review the change before saving. Dynamic or repeated includes require manual review.",
         ]),
-        "dependency-missing" | "configured-resource-missing" | "resources-missing" | "duplicate-resource" => ("resource-manager", "Open resources", vec![
+        "configured-resource-unresolved" | "dependency-unresolved" => ("resource-manager", "Open resources", vec![
+            "The resource inventory is incomplete. Review skipped folders, linked targets, manifest access, and diagnostic scan limits.",
+            "Rerun checks after resolving the incomplete scan. Absence from this inventory does not prove that a resource is missing; do not install or remove files based on this finding alone.",
+        ]),
+        "config-limit" => ("server-configure", "Open configuration", vec![
+            "The config scan reached a diagnostic limit. Review skipped config files and includes manually, then rerun checks.",
+            "Skipped files are not known to be missing or unreadable. Automatic config repairs remain unavailable while the scan is incomplete.",
+        ]),
+        "dependency-missing" | "configured-resource-missing" | "resources-missing" | "duplicate-resource" | "resource-shadowed" | "resource-provider-ambiguous" => ("resource-manager", "Open resources", vec![
             "Inspect the named resource, its manifest dependency, and the reported startup entry. Check for a renamed folder, missing manifest, or duplicate copy.",
             "Obtain a missing dependency from its trusted project source and review compatibility before installing. Do not remove a required dependency just to silence the check.",
             "Rerun checks after the resource files or reviewed startup configuration change. No download or resource start is performed here.",
@@ -111,10 +139,13 @@ fn pending() -> &'static Mutex<BTreeMap<String, PendingPatch>> {
 fn patch_target(inspection: &Inspection) -> Result<&Config, String> {
     let fail = "A safe rconlog patch is not available. Resolve the config/resource findings and review configuration manually.";
     let root = inspection.data_root.as_ref().ok_or(fail)?;
-    if !inspection
-        .checks
-        .iter()
-        .any(|check| check.code == "rconlog-not-started")
+    if inspection.resources_incomplete
+        || inspection.configs_incomplete
+        || inspection.checks_limited
+        || !inspection
+            .checks
+            .iter()
+            .any(|check| check.code == "rconlog-not-started")
         || inspection.checks.iter().any(|check| {
             check.severity == Severity::Error
                 || matches!(
@@ -131,6 +162,8 @@ fn patch_target(inspection: &Inspection) -> Result<&Config, String> {
                         | "resource-link-cycle"
                         | "resource-link-broken"
                         | "dynamic-resource-reference"
+                        | "resource-shadowed"
+                        | "resource-provider-ambiguous"
                 )
         })
     {
@@ -161,11 +194,20 @@ fn patch_target(inspection: &Inspection) -> Result<&Config, String> {
     {
         return Err(fail.into());
     }
-    inspection
+    let config = inspection
         .configs
         .iter()
         .find(|config| config.path == root.join("server.cfg"))
-        .ok_or_else(|| fail.into())
+        .ok_or(fail)?;
+    // dataPath may intentionally share the artifact root, but a bundled
+    // resource's resolved directory (including link targets) is never writable.
+    if inspection.resources.iter().any(|resource| {
+        resource.origin == ResourceOrigin::Artifact
+            && config.path.starts_with(&resource.resolved_path)
+    }) {
+        return Err("Bundled artifact resource files are read-only diagnostic evidence.".into());
+    }
+    Ok(config)
 }
 
 pub(super) fn digest(bytes: &[u8]) -> String {

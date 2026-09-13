@@ -28,6 +28,7 @@ const MAX_RESOURCES: usize = 5000;
 const MAX_RESOURCE_ENTRIES: usize = 20_000;
 const MAX_CHECKS: usize = 2000;
 const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RESOURCE_SCAN_BYTES: usize = MAX_SCAN_BYTES - 4 * 1024 * 1024;
 const MAX_CONFIG_COMMANDS: usize = 20_000;
 const MAX_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
 const PREVIEW_TTL: Duration = Duration::from_secs(15 * 60);
@@ -127,6 +128,8 @@ struct Inspection {
     database_version: Option<String>,
     scan_bytes: usize,
     checks_limited: bool,
+    resources_incomplete: bool,
+    configs_incomplete: bool,
 }
 
 struct Resource {
@@ -136,6 +139,14 @@ struct Resource {
     groups: Vec<String>,
     manifest: parsing::Manifest,
     revision: String,
+    origin: ResourceOrigin,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ResourceOrigin {
+    #[default]
+    Data,
+    Artifact,
 }
 
 struct Config {
@@ -211,15 +222,23 @@ fn check(
 }
 
 fn push_check(inspection: &mut Inspection, item: DiagnosticCheck) {
-    if inspection.checks.len() >= MAX_CHECKS {
-        inspection.checks_limited = true;
+    push_bounded_check(&mut inspection.checks, &mut inspection.checks_limited, item);
+}
+
+fn push_bounded_check(
+    checks: &mut Vec<DiagnosticCheck>,
+    limited: &mut bool,
+    item: DiagnosticCheck,
+) {
+    if checks.len() >= MAX_CHECKS {
+        *limited = true;
         if item.severity == Severity::Error {
-            inspection.checks.remove(MAX_CHECKS - 1);
+            checks.pop();
         } else {
             return;
         }
     }
-    inspection.checks.push(item);
+    checks.push(item);
 }
 
 fn report(inspection: &Inspection) -> PreflightReport {
@@ -316,28 +335,34 @@ fn inspect(request: &PreflightRequest) -> Inspection {
                     "The profile resolves to an existing server data directory.",
                 );
                 inspection.data_root = Some(root.clone());
+                let mut scan = ResourceScan::default();
                 let resources = root.join("resources");
                 if resources.is_dir() {
-                    scan_resources(
-                        &resources,
-                        &resources,
-                        0,
-                        &mut ResourceScan::default(),
-                        &mut inspection,
-                    );
-                    inspection
-                        .resources
-                        .sort_by_key(|resource| resource.name.to_ascii_lowercase());
+                    scan_resources(&resources, &resources, 0, &mut scan, &mut inspection);
                 } else {
-                    check(
-                        &mut inspection,
-                        "Resources",
-                        "resources-missing",
-                        Severity::Error,
-                        "Resources directory missing",
-                        "The resources folder is missing, unreadable, or its link target is unavailable.",
-                    );
+                    match fs::symlink_metadata(&resources) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            check(
+                                &mut inspection,
+                                "Resources",
+                                "resources-missing",
+                                Severity::Error,
+                                "Resources directory missing",
+                                "The resources folder does not exist.",
+                            );
+                        }
+                        _ => {
+                            inspection.resources_incomplete = true;
+                            check(&mut inspection, "Resources", "resource-unreadable", Severity::Warning,
+                                "Resources directory unavailable", "The resources folder could not be inspected. Check access and any linked target before treating resources as missing.");
+                        }
+                    }
                 }
+                scan_artifact_resources(artifact, &mut scan, &mut inspection);
+                inspect_resource_shadowing(&mut inspection);
+                inspection
+                    .resources
+                    .sort_by_key(|resource| resource.name.to_ascii_lowercase());
                 read_config(
                     &root.join("server.cfg"),
                     &root,
@@ -415,14 +440,30 @@ fn read_file_limit(path: &Path, limit: u64) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8.".into())
 }
 
-fn read_inspection_file(path: &Path, inspection: &mut Inspection) -> Result<String, String> {
+#[derive(Debug, PartialEq, Eq)]
+enum InspectionReadError {
+    Budget,
+    Unreadable,
+}
+
+fn read_inspection_file(
+    path: &Path,
+    inspection: &mut Inspection,
+    budget: usize,
+) -> Result<String, InspectionReadError> {
     // Charge every attempt, including unreadable/oversized files, against a shared budget.
-    if inspection.scan_bytes >= MAX_SCAN_BYTES {
-        return Err("The aggregate diagnostic read limit was reached.".into());
+    if inspection.scan_bytes >= budget {
+        return Err(InspectionReadError::Budget);
     }
-    let limit = (MAX_SCAN_BYTES - inspection.scan_bytes).min(MAX_FILE_BYTES as usize);
+    let limit = (budget - inspection.scan_bytes).min(MAX_FILE_BYTES as usize);
     inspection.scan_bytes += limit;
-    let source = read_file_limit(path, limit as u64)?;
+    let source = read_file_limit(path, limit as u64).map_err(|_| {
+        if limit < MAX_FILE_BYTES as usize {
+            InspectionReadError::Budget
+        } else {
+            InspectionReadError::Unreadable
+        }
+    })?;
     inspection.scan_bytes -= limit - source.len();
     Ok(source)
 }
@@ -431,6 +472,48 @@ fn read_inspection_file(path: &Path, inspection: &mut Inspection) -> Result<Stri
 struct ResourceScan {
     ancestors: HashSet<PathBuf>,
     entries: usize,
+    origin: ResourceOrigin,
+}
+
+fn scan_artifact_resources(artifact: &Path, scan: &mut ResourceScan, inspection: &mut Inspection) {
+    if artifact.as_os_str().is_empty() || !artifact.join("FXServer.exe").is_file() {
+        return;
+    }
+    // ServerResources.cpp scans data/resources, then citizen_dir/system_resources.
+    // Inventory only: registering a read target never grants repair/update access.
+    let root = artifact.join("citizen/system_resources");
+    match fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        _ => {}
+    }
+    scan.origin = ResourceOrigin::Artifact;
+    scan_resources(&root, &root, 0, scan, inspection);
+    scan.origin = ResourceOrigin::Data;
+}
+
+fn inspect_resource_shadowing(inspection: &mut Inspection) {
+    // ServerResourceList.cpp normally replaces a resource from an earlier root,
+    // but build-specific filters (e.g. resources_useSystemChat) can select either
+    // copy before loading. Retain both as conditional evidence, never pick one.
+    let system_names: HashSet<_> = inspection
+        .resources
+        .iter()
+        .filter(|resource| resource.origin == ResourceOrigin::Artifact)
+        .map(|resource| resource.name.to_ascii_lowercase())
+        .collect();
+    let shadowed: BTreeSet<_> = inspection
+        .resources
+        .iter()
+        .filter(|resource| {
+            resource.origin == ResourceOrigin::Data
+                && system_names.contains(&resource.name.to_ascii_lowercase())
+        })
+        .map(|resource| resource.name.clone())
+        .collect();
+    for name in shadowed {
+        check(inspection, "Resources", "resource-shadowed", Severity::Warning,
+            "Resource exists in data and artifact", format!("{name} also exists in citizen/system_resources. The later artifact scan normally takes precedence, but build-specific selection settings can filter either copy. Both manifests and groups are retained as conditional evidence; review the active implementation manually. Neither copy was changed."));
+    }
 }
 
 fn scan_resources(
@@ -441,10 +524,11 @@ fn scan_resources(
     inspection: &mut Inspection,
 ) {
     if depth > 12
-        || inspection.scan_bytes >= MAX_SCAN_BYTES
+        || inspection.scan_bytes >= MAX_RESOURCE_SCAN_BYTES
         || inspection.resources.len() >= MAX_RESOURCES
         || scan.entries >= MAX_RESOURCE_ENTRIES
     {
+        inspection.resources_incomplete = true;
         check(
             inspection,
             "Resources",
@@ -456,6 +540,7 @@ fn scan_resources(
         return;
     }
     let Ok(resolved) = path.canonicalize() else {
+        inspection.resources_incomplete = true;
         check(
             inspection,
             "Resources",
@@ -470,6 +555,7 @@ fn scan_resources(
         return;
     };
     if scan.ancestors.contains(&resolved) {
+        inspection.resources_incomplete = true;
         check(
             inspection,
             "Resources",
@@ -490,6 +576,7 @@ fn scan_resources(
                 .canonicalize()
                 .is_ok_and(|path| path.starts_with(&resolved))
             {
+                inspection.resources_incomplete = true;
                 check(
                     inspection,
                     "Resources",
@@ -500,7 +587,7 @@ fn scan_resources(
                 );
                 return;
             }
-            match read_inspection_file(&manifest_path, inspection) {
+            match read_inspection_file(&manifest_path, inspection, MAX_RESOURCE_SCAN_BYTES) {
                 Ok(source) => inspection.resources.push(Resource {
                     name: path
                         .file_name()
@@ -521,23 +608,33 @@ fn scan_resources(
                         .collect(),
                     manifest: parsing::manifest(&source),
                     revision: guided::digest(source.as_bytes()),
+                    origin: scan.origin,
                 }),
-                Err(_) => check(
-                    inspection,
-                    "Resources",
-                    "manifest-unreadable",
-                    Severity::Warning,
-                    "Resource manifest unreadable",
-                    format!(
-                        "A resource manifest under {} could not be parsed.",
-                        relative(path, root)
-                    ),
-                ),
+                Err(error) => {
+                    inspection.resources_incomplete = true;
+                    if error == InspectionReadError::Budget {
+                        check(inspection, "Resources", "scan-limit", Severity::Warning,
+                            "Resource read budget reached", "Additional resource reads were skipped to reserve the remaining diagnostic budget for config files.");
+                    } else {
+                        check(
+                            inspection,
+                            "Resources",
+                            "manifest-unreadable",
+                            Severity::Warning,
+                            "Resource manifest unreadable",
+                            format!(
+                                "A resource manifest under {} could not be parsed.",
+                                relative(path, root)
+                            ),
+                        );
+                    }
+                }
             }
             return;
         }
     }
     let Ok(entries) = fs::read_dir(path) else {
+        inspection.resources_incomplete = true;
         check(
             inspection,
             "Resources",
@@ -553,8 +650,9 @@ fn scan_resources(
     for entry in entries {
         if inspection.resources.len() >= MAX_RESOURCES
             || scan.entries >= MAX_RESOURCE_ENTRIES
-            || inspection.scan_bytes >= MAX_SCAN_BYTES
+            || inspection.scan_bytes >= MAX_RESOURCE_SCAN_BYTES
         {
+            inspection.resources_incomplete = true;
             check(
                 inspection,
                 "Resources",
@@ -567,6 +665,7 @@ fn scan_resources(
         }
         scan.entries += 1;
         let Ok(entry) = entry else {
+            inspection.resources_incomplete = true;
             check(
                 inspection,
                 "Resources",
@@ -590,6 +689,7 @@ fn scan_resources(
         if child.is_dir() {
             scan_resources(&child, root, depth + 1, scan, inspection);
         } else if entry.file_type().is_ok_and(|kind| kind.is_symlink()) && !child.exists() {
+            inspection.resources_incomplete = true;
             check(
                 inspection,
                 "Resources",
@@ -618,9 +718,13 @@ fn config_target(reference: &str, root: &Path, resources: &[Resource]) -> Option
     }
     let (path, allowed_root) = if let Some(resource_ref) = reference.strip_prefix('@') {
         let (name, file) = resource_ref.split_once('/')?;
-        let resource = resources
+        let mut matches = resources
             .iter()
-            .find(|resource| resource.name.eq_ignore_ascii_case(name))?;
+            .filter(|resource| resource.name.eq_ignore_ascii_case(name));
+        let resource = matches.next()?;
+        if matches.any(|other| other.resolved_path != resource.resolved_path) {
+            return None;
+        }
         (resource.path.join(file), resource.resolved_path.as_path())
     } else {
         (root.join(reference), root)
@@ -643,6 +747,7 @@ fn read_config(
     required: bool,
 ) {
     if inspection.executed_commands.len() >= MAX_CONFIG_COMMANDS {
+        inspection.configs_incomplete = true;
         check(
             inspection,
             "Configuration",
@@ -670,6 +775,7 @@ fn read_config(
             .iter()
             .any(|resource| path.starts_with(&resource.resolved_path))
     {
+        inspection.configs_incomplete = true;
         check(
             inspection,
             "Configuration",
@@ -681,6 +787,7 @@ fn read_config(
         return;
     }
     if visited.contains(&path) {
+        inspection.configs_incomplete = true;
         check(
             inspection,
             "Configuration",
@@ -692,6 +799,7 @@ fn read_config(
         return;
     }
     if visited.len() >= MAX_CONFIGS {
+        inspection.configs_incomplete = true;
         check(
             inspection,
             "Configuration",
@@ -703,9 +811,16 @@ fn read_config(
         return;
     }
     visited.insert(path.clone());
-    let source = match read_inspection_file(&path, inspection) {
+    let source = match read_inspection_file(&path, inspection, MAX_SCAN_BYTES) {
         Ok(source) => source,
-        Err(_) => {
+        Err(InspectionReadError::Budget) => {
+            inspection.configs_incomplete = true;
+            check(inspection, "Configuration", "config-limit", Severity::Warning,
+                "Config read budget reached", "Additional config reads were skipped after the aggregate diagnostic read limit. File availability is unknown; review configuration manually.");
+            return;
+        }
+        Err(InspectionReadError::Unreadable) => {
+            inspection.configs_incomplete = true;
             check(
                 inspection,
                 "Configuration",
@@ -726,6 +841,7 @@ fn read_config(
     };
     let (mut commands, uncertain) = parsing::config_commands_checked(&source);
     if uncertain {
+        inspection.configs_incomplete = true;
         let index = inspection.checks.len();
         check(
             inspection,
@@ -754,6 +870,7 @@ fn read_config(
     let mut executed = 0;
     for (line, words) in &commands {
         if inspection.executed_commands.len() >= MAX_CONFIG_COMMANDS {
+            inspection.configs_incomplete = true;
             check(inspection, "Configuration", "config-limit", Severity::Warning,
                 "Config command limit reached", "Additional commands were skipped after 20,000 commands. Review configuration manually.");
             break;
@@ -765,6 +882,7 @@ fn read_config(
                 if let Some(target) = config_target(reference, root, &inspection.resources) {
                     read_config(&target, root, visited, inspection, false);
                 } else {
+                    inspection.configs_incomplete = true;
                     let index = inspection.checks.len();
                     check(
                         inspection,
@@ -780,6 +898,7 @@ fn read_config(
                     }
                 }
             } else {
+                inspection.configs_incomplete = true;
                 let index = inspection.checks.len();
                 check(
                     inspection,
@@ -806,6 +925,7 @@ fn read_config(
 
 fn inspect_dependencies(root: &Path, inspection: &mut Inspection) {
     let mut checks = Vec::new();
+    let mut limited = false;
     let mut names: BTreeMap<String, Vec<&Resource>> = BTreeMap::new();
     for resource in &inspection.resources {
         names
@@ -813,23 +933,50 @@ fn inspect_dependencies(root: &Path, inspection: &mut Inspection) {
             .or_default()
             .push(resource);
     }
-    let providers: BTreeMap<String, &Resource> = inspection
-        .resources
+    let mut implementations = names.clone();
+    for resource in &inspection.resources {
+        for name in &resource.manifest.provides {
+            if resource.name.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            let found = implementations
+                .entry(name.to_ascii_lowercase())
+                .or_default();
+            if found.last().is_none_or(|item| item.path != resource.path) {
+                found.push(resource);
+            }
+        }
+    }
+    let candidates = |key: &str| implementations.get(key).map(Vec::as_slice).unwrap_or(&[]);
+    let required: BTreeMap<&str, &Resource> = implementations
         .iter()
-        .flat_map(|resource| {
-            resource
-                .manifest
-                .provides
+        .filter_map(|(name, found)| {
+            let first = *found.first()?;
+            let same_origin = names[&first.name.to_ascii_lowercase()]
                 .iter()
-                .map(move |name| (name.to_ascii_lowercase(), resource))
+                .all(|item| item.origin == first.origin);
+            found
+                .iter()
+                .all(|item| same_origin && item.name.eq_ignore_ascii_case(&first.name))
+                .then_some((name.as_str(), first))
         })
         .collect();
+    for (name, found) in &implementations {
+        if found.len() > 1 && found.len() > names.get(name).map_or(0, Vec::len) {
+            push_bounded_check(&mut checks, &mut limited, DiagnosticCheck {
+                category: "Resources".into(),
+                code: "resource-provider-ambiguous".into(),
+                severity: Severity::Warning,
+                title: "Resource provider needs runtime review".into(),
+                detail: format!("{name} has multiple possible implementations. Provider selection depends on which resources have started; conditional dependency findings are warnings."),
+                resource: Some(name.clone()), file: None, line: None, guidance: None,
+            });
+        }
+    }
     let mut enabled = BTreeSet::new();
+    let mut pending = Vec::new();
     for config in &inspection.configs {
         for (line, words) in &config.commands {
-            if checks.len() >= MAX_CHECKS {
-                break;
-            }
             if !matches!(words[0].to_ascii_lowercase().as_str(), "ensure" | "start") {
                 continue;
             }
@@ -837,7 +984,7 @@ fn inspect_dependencies(root: &Path, inspection: &mut Inspection) {
                 continue;
             };
             if target.contains(['$', '*', '?']) {
-                checks.push(DiagnosticCheck {
+                push_bounded_check(&mut checks, &mut limited, DiagnosticCheck {
                     category: "Resources".into(), code: "dynamic-resource-reference".into(), severity: Severity::Warning,
                     title: "Resource reference needs review".into(), detail: "A dynamic startup reference could not be resolved without executing configuration commands.".into(),
                     resource: None, file: Some(relative(&config.path, root)), line: Some(*line),
@@ -845,71 +992,103 @@ fn inspect_dependencies(root: &Path, inspection: &mut Inspection) {
                 });
                 continue;
             }
-            let found: Vec<_> = inspection
-                .resources
-                .iter()
-                .filter(|resource| {
-                    resource.name.eq_ignore_ascii_case(target)
-                        || resource
+            let references: Vec<_> = if target.starts_with('[') && target.ends_with(']') {
+                inspection
+                    .resources
+                    .iter()
+                    .filter(|resource| {
+                        resource
                             .groups
                             .iter()
                             .any(|group| group.eq_ignore_ascii_case(target))
-                })
-                .collect();
-            if found.is_empty() && !providers.contains_key(&target.to_ascii_lowercase()) {
-                checks.push(DiagnosticCheck {
-                    category: "Resources".into(),
-                    code: "configured-resource-missing".into(),
-                    severity: Severity::Error,
-                    title: "Configured resource missing".into(),
-                    detail: format!("No resource or non-empty group matches {target}."),
-                    resource: Some(target.clone()),
-                    file: Some(relative(&config.path, root)),
-                    line: Some(*line),
-                    guidance: None,
-                });
+                    })
+                    .map(|resource| resource.name.to_ascii_lowercase())
+                    .collect()
+            } else {
+                vec![target.to_ascii_lowercase()]
+            };
+            if references.is_empty() || references.iter().all(|name| candidates(name).is_empty()) {
+                push_bounded_check(
+                    &mut checks,
+                    &mut limited,
+                    DiagnosticCheck {
+                        category: "Resources".into(),
+                        code: if inspection.resources_incomplete {
+                            "configured-resource-unresolved"
+                        } else {
+                            "configured-resource-missing"
+                        }
+                        .into(),
+                        severity: if inspection.resources_incomplete {
+                            Severity::Warning
+                        } else {
+                            Severity::Error
+                        },
+                        title: if inspection.resources_incomplete {
+                            "Configured resource not verified"
+                        } else {
+                            "Configured resource missing"
+                        }
+                        .into(),
+                        detail: if inspection.resources_incomplete {
+                            format!("The incomplete resource inventory could not verify {target}. Check skipped folders and manifests before treating it as missing.")
+                        } else {
+                            format!("No resource or non-empty group matches {target}.")
+                        },
+                        resource: Some(target.clone()),
+                        file: Some(relative(&config.path, root)),
+                        line: Some(*line),
+                        guidance: None,
+                    },
+                );
             }
-            for resource in found {
-                enabled.insert(resource.name.to_ascii_lowercase());
-            }
-            if let Some(provider) = providers.get(&target.to_ascii_lowercase()) {
-                enabled.insert(provider.name.to_ascii_lowercase());
-            }
-        }
-    }
-    let mut pending: Vec<_> = enabled.iter().cloned().collect();
-    while let Some(name) = pending.pop() {
-        if let Some(resources) = names.get(&name) {
-            for resource in resources {
-                for dependency in &resource.manifest.dependencies {
-                    let key = dependency.to_ascii_lowercase();
-                    let target = providers
-                        .get(&key)
-                        .map(|provider| provider.name.to_ascii_lowercase())
-                        .unwrap_or(key);
-                    if !dependency.starts_with('/')
-                        && names.contains_key(&target)
-                        && enabled.insert(target.clone())
-                    {
-                        pending.push(target);
+            for name in references {
+                if let Some(resource) = required.get(name.as_str()) {
+                    let name = resource.name.to_ascii_lowercase();
+                    if enabled.insert(name.clone()) {
+                        pending.push(name);
                     }
                 }
             }
         }
     }
-    for resources in names.values().filter(|resources| resources.len() > 1) {
-        if checks.len() >= MAX_CHECKS {
-            break;
+    // Ambiguous implementations remain warning-only unless independently required.
+    // Do not expand every possible provider path into an unbounded candidate graph.
+    while let Some(name) = pending.pop() {
+        if let Some(resources) = names.get(&name) {
+            for resource in resources {
+                for dependency in &resource.manifest.dependencies {
+                    if dependency.starts_with('/') {
+                        continue;
+                    }
+                    if let Some(resource) = required.get(dependency.to_ascii_lowercase().as_str()) {
+                        let name = resource.name.to_ascii_lowercase();
+                        if enabled.insert(name.clone()) {
+                            pending.push(name);
+                        }
+                    }
+                }
+            }
         }
-        checks.push(DiagnosticCheck {
+    }
+    for resources in names.values() {
+        let data_count = resources
+            .iter()
+            .filter(|item| item.origin == ResourceOrigin::Data)
+            .count();
+        let duplicate_count = data_count.max(resources.len() - data_count);
+        if duplicate_count <= 1 {
+            continue;
+        }
+        push_bounded_check(&mut checks, &mut limited, DiagnosticCheck {
             category: "Resources".into(),
             code: "duplicate-resource".into(),
             severity: Severity::Error,
             title: "Duplicate resource name".into(),
             detail: format!(
-                "{} exists in {} folders. FXServer resource resolution is ambiguous.",
+                "{} exists in {} folders within one resource root. FXServer resource resolution is ambiguous.",
                 resources[0].name,
-                resources.len()
+                duplicate_count
             ),
             resource: Some(resources[0].name.clone()),
             file: None,
@@ -919,33 +1098,50 @@ fn inspect_dependencies(root: &Path, inspection: &mut Inspection) {
     }
     for resource in &inspection.resources {
         for dependency in &resource.manifest.dependencies {
-            if checks.len() >= MAX_CHECKS {
-                break;
-            }
             if dependency.starts_with('/')
                 || names.contains_key(&dependency.to_ascii_lowercase())
-                || providers.contains_key(&dependency.to_ascii_lowercase())
+                || implementations.contains_key(&dependency.to_ascii_lowercase())
             {
                 continue;
             }
-            checks.push(DiagnosticCheck {
-                category: "Dependencies".into(),
-                code: "dependency-missing".into(),
-                severity: if enabled.contains(&resource.name.to_ascii_lowercase()) {
-                    Severity::Error
-                } else {
-                    Severity::Warning
+            push_bounded_check(
+                &mut checks,
+                &mut limited,
+                DiagnosticCheck {
+                    category: "Dependencies".into(),
+                    code: if inspection.resources_incomplete {
+                        "dependency-unresolved"
+                    } else {
+                        "dependency-missing"
+                    }
+                    .into(),
+                    severity: if !inspection.resources_incomplete
+                        && enabled.contains(&resource.name.to_ascii_lowercase())
+                    {
+                        Severity::Error
+                    } else {
+                        Severity::Warning
+                    },
+                    title: if inspection.resources_incomplete {
+                        "Required dependency not verified"
+                    } else {
+                        "Required dependency missing"
+                    }
+                    .into(),
+                    detail: if inspection.resources_incomplete {
+                        format!("{} requires {dependency}, which could not be verified in the incomplete resource inventory.", resource.name)
+                    } else {
+                        format!("{} requires {dependency}.", resource.name)
+                    },
+                    resource: Some(resource.name.clone()),
+                    file: Some(relative(&resource.path, root)),
+                    line: None,
+                    guidance: None,
                 },
-                title: "Required dependency missing".into(),
-                detail: format!("{} requires {dependency}.", resource.name),
-                resource: Some(resource.name.clone()),
-                file: Some(relative(&resource.path, root)),
-                line: None,
-                guidance: None,
-            });
+            );
         }
-        if resource.manifest.dynamic && checks.len() < MAX_CHECKS {
-            checks.push(DiagnosticCheck {
+        if resource.manifest.dynamic {
+            push_bounded_check(&mut checks, &mut limited, DiagnosticCheck {
                 category: "Dependencies".into(),
                 code: "dynamic-dependency".into(),
                 severity: Severity::Info,
@@ -960,13 +1156,10 @@ fn inspect_dependencies(root: &Path, inspection: &mut Inspection) {
             });
         }
     }
-    let limit_reached = checks.len() >= MAX_CHECKS;
     for item in checks {
         push_check(inspection, item);
     }
-    if limit_reached {
-        check(inspection, "Resources", "check-limit", Severity::Warning, "Additional findings omitted", "Only the first 2,000 resource findings are shown. Resolve these findings and run the checks again.");
-    }
+    inspection.checks_limited |= limited;
     check(inspection, "Resources", "resource-scan", Severity::Info, "Resource inventory", format!("{} manifests inspected. Runtime constraints such as /server and /onesync are not treated as resource names.", inspection.resources.len()));
 }
 
@@ -1468,5 +1661,7 @@ fn write_archive(path: &Path, entries: &[DiagnosticEntry]) -> Result<(), String>
     result
 }
 
+#[cfg(test)]
+mod artifact_tests;
 #[cfg(test)]
 mod tests;

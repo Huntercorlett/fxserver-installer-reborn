@@ -204,6 +204,160 @@ fn expired_and_unknown_reviews_never_write() {
 
 #[cfg(windows)]
 #[test]
+fn artifact_resources_and_included_configs_are_evidence_never_patch_targets() {
+    let fixture = Fixture::new();
+    fixture.artifact_resource("rconlog", "fx_version 'cerulean'");
+    let artifact = fixture
+        .root
+        .join("artifacts/citizen/system_resources/rconlog");
+    let manifest = read_bounded(&artifact.join("fxmanifest.lua")).unwrap();
+    fs::write(artifact.join("server.cfg"), "# artifact configuration\n").unwrap();
+    let cfg = fixture.root.join("data/server.cfg");
+    fs::write(&cfg, "exec @rconlog/server.cfg\n").unwrap();
+    let preview = prepare_patch(fixture.request()).unwrap();
+    assert_eq!(Path::new(&preview.path), cfg.canonicalize().unwrap());
+    assert_ne!(
+        Path::new(&preview.path),
+        artifact.join("server.cfg").canonicalize().unwrap()
+    );
+    let store = fixture.root.join("history");
+    apply_patch(&store, &preview.id).unwrap();
+    assert_eq!(read_bounded(&cfg).unwrap(), preview.after);
+    assert_eq!(
+        read_bounded(&artifact.join("server.cfg")).unwrap(),
+        "# artifact configuration\n"
+    );
+    assert_eq!(
+        read_bounded(&artifact.join("fxmanifest.lua")).unwrap(),
+        manifest
+    );
+
+    fs::remove_file(&cfg).unwrap();
+    assert!(prepare_patch(fixture.request()).is_err());
+    assert!(!cfg.exists());
+    assert_eq!(
+        read_bounded(&artifact.join("server.cfg")).unwrap(),
+        "# artifact configuration\n"
+    );
+}
+
+#[test]
+fn artifact_dependency_guidance_and_changed_evidence_cannot_repair_artifact_files() {
+    let fixture = Fixture::new();
+    fixture.artifact_resource("rconlog", "fx_version 'cerulean'");
+    let preview = prepare_patch(fixture.request()).unwrap();
+    fixture.artifact_resource("rconlog", "dependency 'missing-lib'");
+    let result = report(&inspect(&fixture.request()));
+    let guidance = result
+        .checks
+        .iter()
+        .find(|item| item.code == "dependency-missing")
+        .unwrap()
+        .guidance
+        .as_ref()
+        .unwrap();
+    assert_eq!(guidance.page, "artifact-install");
+    assert!(!guidance.patch_available);
+    let store = fixture.root.join("history");
+    assert!(apply_patch(&store, &preview.id).is_err());
+    assert!(!store.exists());
+    assert_eq!(
+        read_bounded(&fixture.root.join("data/server.cfg")).unwrap(),
+        ""
+    );
+}
+
+#[test]
+fn resource_shadowing_or_provider_ambiguity_prevents_automatic_config_repairs() {
+    let fixture = Fixture::new();
+    fixture.artifact_resource("rconlog", "fx_version 'cerulean'");
+    fixture.resource("alternative", "provide 'rconlog'");
+    assert!(prepare_patch(fixture.request()).is_err());
+    fixture.resource("alternative", "fx_version 'cerulean'");
+    fixture.resource("rconlog", "fx_version 'cerulean'");
+    assert!(prepare_patch(fixture.request()).is_err());
+}
+
+#[test]
+fn bundled_resource_configs_cannot_be_patch_targets_even_as_direct_or_linked_data_paths() {
+    let fixture = Fixture::new();
+    fixture.artifact_resource("chat", "fx_version 'cerulean'");
+    fixture.artifact_resource("rconlog", "fx_version 'cerulean'");
+    let chat = fixture.root.join("artifacts/citizen/system_resources/chat");
+    fs::create_dir(chat.join("resources")).unwrap();
+    fs::write(chat.join("server.cfg"), "# bundled configuration\n").unwrap();
+    let linked = fixture.root.join("linked-data");
+    super::super::tests::link_directory(&chat, &linked);
+    for data_path in [&chat, &linked] {
+        fs::write(
+            fixture.root.join("txData/default/config.json"),
+            serde_json::to_vec(&json!({"server": {"dataPath": data_path}})).unwrap(),
+        )
+        .unwrap();
+        let inspection = inspect(&fixture.request());
+        assert!(!inspection.resources_incomplete);
+        assert!(!inspection.configs_incomplete);
+        assert!(!report(&inspection).blocking);
+        assert!(patch_target(&inspection)
+            .err()
+            .unwrap()
+            .contains("Bundled artifact resource"));
+        assert!(prepare_patch(fixture.request()).is_err());
+        assert_eq!(
+            read_bounded(&chat.join("server.cfg")).unwrap(),
+            "# bundled configuration\n"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn user_configs_at_the_artifact_root_or_sibling_data_folder_remain_repairable() {
+    let fixture = Fixture::new();
+    fixture.artifact_resource("rconlog", "fx_version 'cerulean'");
+    let artifact = fixture.root.join("artifacts");
+    let bundled_manifest = artifact.join("citizen/system_resources/rconlog/fxmanifest.lua");
+    let original_manifest = read_bounded(&bundled_manifest).unwrap();
+    for data_path in [artifact.clone(), artifact.join("user-data")] {
+        fs::create_dir_all(data_path.join("resources")).unwrap();
+        let cfg = data_path.join("server.cfg");
+        fs::write(&cfg, "# user configuration\n").unwrap();
+        fs::write(
+            fixture.root.join("txData/default/config.json"),
+            serde_json::to_vec(&json!({"server": {"dataPath": data_path}})).unwrap(),
+        )
+        .unwrap();
+        let preview = prepare_patch(fixture.request()).unwrap();
+        assert_eq!(Path::new(&preview.path), cfg.canonicalize().unwrap());
+        apply_patch(&fixture.root.join("history"), &preview.id).unwrap();
+        assert_eq!(
+            read_bounded(&cfg).unwrap(),
+            "# user configuration\nensure rconlog\n"
+        );
+        assert_eq!(read_bounded(&bundled_manifest).unwrap(), original_manifest);
+    }
+}
+
+#[test]
+fn incomplete_scans_disable_repairs_even_when_their_warning_was_omitted() {
+    let fixture = installed();
+    for incomplete_resources in [true, false] {
+        let mut inspection = inspect(&fixture.request());
+        assert!(patch_target(&inspection).is_ok());
+        if incomplete_resources {
+            inspection.resources_incomplete = true;
+        } else {
+            inspection.configs_incomplete = true;
+        }
+        assert!(patch_target(&inspection).is_err());
+    }
+    let mut inspection = inspect(&fixture.request());
+    inspection.checks_limited = true;
+    assert!(patch_target(&inspection).is_err());
+}
+
+#[cfg(windows)]
+#[test]
 fn reviewed_patch_is_single_use_and_preserves_encrypted_previous_content() {
     let fixture = installed();
     let cfg = fixture.root.join("data/server.cfg");

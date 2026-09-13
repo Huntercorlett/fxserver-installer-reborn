@@ -39,6 +39,15 @@ impl Fixture {
         fs::write(path.join("fxmanifest.lua"), content).unwrap();
     }
 
+    pub(super) fn artifact_resource(&self, path: &str, content: &str) {
+        let path = self
+            .root
+            .join("artifacts/citizen/system_resources")
+            .join(path);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("fxmanifest.lua"), content).unwrap();
+    }
+
     pub(super) fn request(&self) -> PreflightRequest {
         PreflightRequest {
             artifact_path: self.root.join("artifacts").to_string_lossy().into_owned(),
@@ -438,11 +447,44 @@ fn resource_reads_and_config_parsing_share_a_bounded_budget() {
     );
     assert!(inspection.configs.is_empty());
     assert_eq!(inspection.scan_bytes, MAX_SCAN_BYTES);
+    assert!(inspection.configs_incomplete);
+    assert!(inspection
+        .checks
+        .iter()
+        .any(|item| item.code == "config-limit" && item.severity == Severity::Warning));
+    assert!(!inspection
+        .checks
+        .iter()
+        .any(|item| item.severity == Severity::Error));
 
     inspection.scan_bytes = MAX_SCAN_BYTES - 8;
     fs::write(root.join("server.cfg"), "larger than the remaining budget").unwrap();
-    assert!(read_inspection_file(&root.join("server.cfg"), &mut inspection).is_err());
+    assert_eq!(
+        read_inspection_file(&root.join("server.cfg"), &mut inspection, MAX_SCAN_BYTES),
+        Err(InspectionReadError::Budget)
+    );
     assert_eq!(inspection.scan_bytes, MAX_SCAN_BYTES);
+
+    let mut partial = Inspection {
+        scan_bytes: MAX_SCAN_BYTES - 8,
+        ..Inspection::default()
+    };
+    read_config(
+        &root.join("server.cfg"),
+        &root,
+        &mut HashSet::new(),
+        &mut partial,
+        true,
+    );
+    assert!(partial.configs_incomplete);
+    assert!(partial
+        .checks
+        .iter()
+        .any(|item| item.code == "config-limit"));
+    assert!(!partial
+        .checks
+        .iter()
+        .any(|item| item.code == "config-unreadable"));
 
     fs::write(root.join("server.cfg"), "exec missing.cfg\n".repeat(10_000)).unwrap();
     let inspection = inspect(&fixture.request());

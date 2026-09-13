@@ -43,7 +43,10 @@ test("failed release lookup and browser previews never invent an installer", asy
 
 test("numeric policy beta and GitHub prereleases are offered only to current beta users", async () => {
   assert.ok(policy.betaVersions.includes("0.4.0"));
-  await assert.rejects(load("0.3.2", fixture("0.4.0")).fetchLatestAppRelease, /release channel/);
+  for (const version of policy.betaVersions) {
+    await assert.rejects(load("0.3.2", fixture(version)).fetchLatestAppRelease, /release channel/);
+    assert.equal((await load("0.4.0", fixture(version, true)).fetchLatestAppRelease()).version, version);
+  }
   await assert.rejects(load("0.3.2", fixture("0.5.0", true)).fetchLatestAppRelease, /release channel/);
   assert.equal((await load("0.4.0", fixture("0.5.0", true)).fetchLatestAppRelease()).version, "0.5.0");
   assert.equal((await load("0.4.0", fixture("0.5.0")).fetchLatestAppRelease()).version, "0.5.0");

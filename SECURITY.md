@@ -8,7 +8,7 @@ Include the app version, Windows version, affected workflow, reproduction steps 
 
 ## Supported Scope
 
-This project builds a Windows desktop app. Security fixes target the latest release; older builds do not have a maintenance guarantee. Version 0.4.0 is a beta with incomplete live-environment validation, not a security certification.
+This project builds a Windows desktop app. Security fixes target the latest release; older builds do not have a maintenance guarantee. Version 0.4.1 is a beta with incomplete live-environment validation, not a security certification.
 
 - The app can run installers, operate MariaDB, manage FXServer processes, and replace user-selected files. Only run it for servers and databases you are authorized to administer.
 - Resource code and SQL files are executable inputs. Install only trusted resources and review SQL before running it. A preview or checksum does not establish that third-party content is trustworthy.

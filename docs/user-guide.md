@@ -137,6 +137,7 @@ Examples of saved or remembered state:
 - RCON password, protected with Windows data protection.
 - Per-workspace resource pin/ignore preferences and optional Live Bridge connection settings.
 - Local Incident Timeline history, bounded to 1,000 events across all workspaces.
+- Website Hosting sites (name, folder, port, access mode, options) in `website-hosting.json` in the app data directory. They are shared by all workspaces.
 - Encrypted per-file configuration history, resource snapshot metadata, backup metadata, and restore-test evidence.
 - Live Bridge's encrypted app pairing, when explicitly installed. Its separate server-only token file lives in the installed resource, not in client files or `server.cfg`.
 
@@ -414,6 +415,43 @@ Pause takes effect after the current resource finishes. Stop also waits for that
 
 Previews expire 30 minutes after preparation. File changes, expired previews, workspace changes, or newly pinned/ignored resources can invalidate a review. Re-review instead of assuming an old approval applies to new content. Queue state and outcomes survive navigation, but not an app restart; only pin/ignore preferences are persisted. Applying a queue does not stop/restart resources or run database migrations automatically.
 
+## MariaDB login
+
+Enter the MariaDB admin login once. Every database page (MariaDB, SQL Runner, Backups & Restore, Database Browser) shares it for the rest of the session and connects automatically, showing a compact "Connected" bar with a **Change** button.
+
+- For a local database (`localhost` / `127.0.0.1`) only the password is asked for. Use **Advanced** to change the user, port, or default database.
+- For any other host the full login (host, port, user, password) is shown.
+- Turn on **Remember on this PC** to skip the prompt after restarting the app. The login is saved encrypted for your Windows account (the same protection as saved RCON passwords), one per workspace, and only after a successful connection. Turning it off deletes the saved copy, as does removing the workspace.
+
+## FiveM for GTAV Enhanced
+
+The app can run either FiveM edition. Point **Manage Server** at the folder containing `FXServer.exe` (Legacy) or `cfx-server.exe` (FiveM for GTAV Enhanced); the correct executable is detected automatically.
+
+- Download Enhanced server files from the **Enhanced** tab on the Cfx.re Server Download page and extract them to their own folder. The in-app artifact installer and browser install Legacy builds only, and refuse to install into a folder that already contains `cfx-server.exe`.
+- Enhanced is versioned separately, so the Artifact Info health status shows "FiveM for GTAV Enhanced" instead of a Legacy update recommendation.
+- Enhanced changes some server settings (for example only one `endpoint_add_tcp` and one `endpoint_add_udp`, no OneSync setup, `sv_devMode` required for client dev tools). See "What's Changed in FiveM for GTAV Enhanced" on docs.fivem.net before migrating a server.cfg.
+
+## Website Hosting
+
+**Website Hosting** serves a folder of website files on a port you choose, so you can host a server landing page, status page, or launcher site next to FXServer.
+
+1. Open **Website Hosting** and choose **Add Website**.
+2. Pick the folder that contains `index.html` (use **Browse**), give the site a name, and choose a port that nothing else uses. FXServer commonly uses 30120 and txAdmin 40120, so pick something else such as 8080.
+3. Choose who can open it. **This computer only** binds to `127.0.0.1` and is right for testing. **Other devices / internet** binds to all network interfaces.
+4. Press **Start**, then **Open** to view it. **Recent requests** lists the latest hits with their status codes, which helps track down missing files.
+
+What it does and does not do:
+
+- It is a static file server. HTML, CSS, JavaScript, images, fonts, audio and video are served as-is. PHP, Node.js, databases, and HTTPS are not provided.
+- `index.html` (or `index.htm`) is the home page of each folder, and an optional `404.html` is used for missing pages. Turn on **Single-page app mode** for client-side routers so unknown page addresses fall back to `index.html`.
+- Hidden files and folders (`.git`, `.env`, ...) and anything outside the site folder, including through shortcuts or links, are never served. Scripts and configuration-style files (`.php`, `.py`, `.sh`, `.bat`, `.cfg`, `.ini`, `.env`, `.sql`, `.log`, `.bak`, and similar) return "403 Forbidden" so their contents cannot leak. Do not point a site at your FXServer or txData folder.
+- Sites run inside FXServer Installer. They stay online while the app is open or in the tray and stop when you quit. Turn on **Start with FXServer Installer** to bring a site up automatically on launch. Editing a running site restarts it.
+
+Reaching a site from other devices:
+
+- Windows may ask whether to allow the app through Windows Firewall the first time a site listens on the network. If not, allow the port with the command shown on the site card (run it in an administrator Command Prompt).
+- To reach it from the internet you also need to forward the port on your router to this PC, and you are exposing the machine to the internet, so keep only public files in the site folder. For a public site with a domain name and HTTPS, put a proper web server or reverse proxy in front instead.
+
 ## Logs
 
 The Logs navigation group contains:
@@ -474,6 +512,10 @@ Check that the MariaDB service is running, the port is correct, networking is en
 ### RCON command fails
 
 Confirm that FXServer is running, the RCON port is correct, and `server.cfg` includes both `ensure rconlog` and `rcon_password`.
+
+### A website will not start
+
+The message on the site card names the cause. "Port is already in use" means another program (often FXServer, txAdmin, or another site) is listening there; pick a different port. "Windows refused access" means the port is reserved by the system; also pick a different one. If a site works on this computer but not from another device, check the site is set to **Other devices / internet**, the Windows Firewall port is allowed, and the address uses this PC's network IP rather than `127.0.0.1`.
 
 ### GitHub update checks return 403
 

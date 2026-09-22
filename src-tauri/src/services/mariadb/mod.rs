@@ -1,7 +1,8 @@
 pub mod backup;
 pub mod detect;
 pub mod install;
-mod package;
+pub(crate) mod native;
+pub(crate) mod package;
 pub mod permissions;
 pub mod query;
 pub mod service;

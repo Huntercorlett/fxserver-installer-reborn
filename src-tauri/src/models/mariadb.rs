@@ -24,6 +24,9 @@ pub struct MariaDBCredentials {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MariaDBInstallOptions {
+    /// Series (`11.4`) or exact release (`11.4.5`); `None` installs the default 10.11 LTS.
+    #[serde(default)]
+    pub version: Option<String>,
     pub root_password: String,
     pub service_name: String,
     pub port: u16,
@@ -132,3 +135,5 @@ pub struct MariaDBBackupResult {
     pub size_bytes: u64,
     pub stderr: String,
 }
+
+pub use crate::services::mariadb::package::{MariaDBRelease, MariaDBSeries};

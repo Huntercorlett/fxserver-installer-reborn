@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "FXServer Installer",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "identifier": "com.fxserver.installer",
   "build": {
     "frontendDist": "../dist",
@@ -40,6 +40,7 @@
   },
   "bundle": {
     "active": true,
+    "copyright": "Credits: Hunter Corlett (Huntercorlett), .zox (zoxile)",
     "targets": [
       "nsis"
     ],

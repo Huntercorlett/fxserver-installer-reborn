@@ -64,7 +64,7 @@ const environmentUrl = build("features/fxserver/fxserverEnv.ts");
 const workspaceModelUrl = build("core/workspaceSettings.ts", { "$lib/features/fxserver/fxserverEnv": environmentUrl });
 const { emptyWorkspace, publicEnvironment } = await import(workspaceModelUrl);
 assert.deepEqual(publicEnvironment({ TXHOST_DATA_PATH: "C:/fixture", txhost_default_dbpass: "hidden", txhost_default_account: "hidden", MYSQL_CONNECTION_STRING: "hidden", API_KEY: "hidden" }), { TXHOST_DATA_PATH: "C:/fixture" });
-const databaseUrl = build("core/databaseSession.svelte.ts");
+const databaseUrl = build("core/databaseSession.svelte.ts", { "@tauri-apps/api/core": transport });
 const database = await import(databaseUrl);
 const settingsUrl = build("features/fxserver/fxserverSettings.svelte.ts", {
   "$lib/core/logger.svelte": loggerUrl, "$lib/core/workspaceSettings": workspaceModelUrl,
@@ -75,6 +75,7 @@ const pathsUrl = url('let path = ""; export const getInstallPath = () => path; e
 const workspaceUrl = build("core/workspaces.svelte.ts", {
   "@tauri-apps/api/core": transport, "./databaseSession.svelte": databaseUrl, "./paths.svelte": pathsUrl,
   "./tasks.svelte": taskUrl, "$lib/features/fxserver/fxserverSettings.svelte": settingsUrl, "./workspaceSettings": workspaceModelUrl,
+  "svelte": url(`export { untrack } from ${JSON.stringify(import.meta.resolve("svelte/internal/client"))};`),
 });
 const workspaces = await import(workspaceUrl);
 const first = emptyWorkspace("default", "First");
@@ -164,43 +165,9 @@ for (const editorContent of ["x\n".repeat(20_000), "x".repeat(200_001)]) {
   assert.equal(vm.runInNewContext(richExpression, { editorContent }), false, "Large configurations must bypass highlighted DOM");
 }
 
-const sqlSource = read("features/mariadb/SqlRunnerPage.svelte").match(/<script lang="ts">([\s\S]*?)<\/script>/)[1];
-const sqlAst = ts.createSourceFile("sql.ts", sqlSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-const sqlVariables = new Set(["credentials", "credentialsReady", "backupTables", "selectedBackupTable", "backupMode", "backupDatabaseName", "backupOptions", "backupTableRequestId", "active", "error"]);
-const sqlFixture = sqlAst.statements.filter((node) =>
-  ts.isVariableStatement(node) && node.declarationList.declarations.some((entry) => sqlVariables.has(entry.name.getText(sqlAst)))
-  || ts.isFunctionDeclaration(node) && node.name?.text === "refreshBackupTables"
-  || ts.isExpressionStatement(node) && ts.isCallExpression(node.expression) && node.expression.expression.getText(sqlAst) === "$effect",
-).map((node) => node.getText(sqlAst)).join("\n");
-let tableRequests = 0;
-globalThis.managerSafety.tables = async () => { tableRequests++; throw new Error("Offline table list"); };
-const internalUrl = import.meta.resolve("svelte/internal/client");
-const fixtureSource = `import { untrack } from ${JSON.stringify(internalUrl)};
-const databaseSession = { credentials: null, defaults: { host: "localhost", port: 3306, username: "root", database: "fixture" } };
-const listMariaDBTables = (...args) => globalThis.managerSafety.tables(...args);
-export function createFixture() {
-${sqlFixture}
-return { select(database) { backupDatabaseName = database; credentialsReady = true; backupMode = "tables"; }, rows() { return backupTables; } };
-}`;
-let fixtureCode = compileModule(ts.transpile(fixtureSource, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 }), { filename: "sql-effects.svelte.js", generate: "client" }).js.code;
-fixtureCode = fixtureCode.replace(/(from\s+|import\s+)["'](svelte\/[^"']+)["']/g, (_, prefix, name) => `${prefix}${JSON.stringify(import.meta.resolve(name))}`);
-const { createFixture } = await import(url(fixtureCode));
-const { effect_root, render_effect, flush: flushSync } = await import(internalUrl);
-let sql;
-const destroy = effect_root(() => render_effect(() => { sql = createFixture(); }));
-flushSync();
-sql.select("fixture");
-for (let i = 0; i < 5; i++) { flushSync(); await new Promise(setImmediate); }
-assert.equal(tableRequests, 1, "A failed table list must not retry through its own effect");
-globalThis.managerSafety.tables = async () => { tableRequests++; return ["fixture_table"]; };
-sql.select("other");
-for (let i = 0; i < 3; i++) { flushSync(); await new Promise(setImmediate); }
-assert.equal(tableRequests, 2);
-assert.deepEqual([...sql.rows()], ["fixture_table"]);
-destroy();
 
 // Svelte compilation checks only touched views; the parent owns full checks/build/UI.
-for (const path of ["mariadb/ConnectionCard", "mariadb/SqlRunnerPage", "mariadb/MariaDBPanel", "mariadb/DatabaseBrowserPage", "mariadb/DatabaseRowEditor", "diagnostics/DiagnosticsPage", "config-history/ConfigHistoryPanel", "fxserver/ConfigureServerPage", "fxserver/ManageServerPage"]) {
+for (const path of ["mariadb/ConnectionCard", "mariadb/ServerExportTab", "mariadb/ServerImportTab", "mariadb/ServerSqlTab", "mariadb/MariaDBPanel", "mariadb/DatabaseBrowserPage", "mariadb/DatabaseRowEditor", "diagnostics/DiagnosticsPage", "config-history/ConfigHistoryPanel", "fxserver/ConfigureServerPage", "fxserver/ManageServerPage"]) {
   compile(read(`features/${path}.svelte`), { filename: `${path}.svelte`, generate: "client" });
 }
-console.log("Manager safety fixtures passed: redaction, storage failures, credential isolation, same-path switches, stale export dialogs/history reads, escaped HTML, bounded config rendering, reactive retry prevention, touched-view compilation.");
+console.log("Manager safety fixtures passed: redaction, storage failures, credential isolation, same-path switches, stale export dialogs/history reads, escaped HTML, bounded config rendering, touched-view compilation.");

@@ -66,6 +66,7 @@
 		database: databaseSession.credentials?.database ?? databaseSession.defaults.database,
 	});
 	let installOptions = $state<MariaDBInstallOptions>({
+		version: "",
 		rootPassword: "",
 		serviceName: "MariaDB",
 		port: 3306,
@@ -90,6 +91,9 @@
 	});
 
 	onMount(() => {
+		// A login entered on another database page (or saved) connects automatically.
+		if (databaseSession.credentials && !credentialsReady) void applyCredentials();
+
 		const statusTimer = window.setTimeout(() => {
 			void refreshStatus(false);
 		}, 120);
@@ -367,7 +371,7 @@
 		<Notice
 			tone="warn"
 			title="Back up before changing MariaDB"
-			message="Before installing, updating, or uninstalling MariaDB through the app, create a fresh backup of any databases you care about. Use Queries & Files for backups."
+			message="Before installing, updating, or uninstalling MariaDB through the app, create a fresh backup of any databases you care about. Use Database Browser → Export for backups."
 			onDismiss={() => (backupWarningDismissed = true)}
 			class="px-4 py-3 text-sm"
 		/>

@@ -85,7 +85,7 @@ async (page) => {
   if (await parent.getAttribute("aria-expanded") !== "true") await parent.click();
   await nav.getByTitle("Database Browser", { exact: true }).click();
   await page.getByRole("heading", { name: "Database Browser", exact: true }).waitFor();
-  await page.getByRole("button", { name: "Change Credentials", exact: true }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
   await page.getByTitle("SQL NULL", { exact: true }).first().waitFor();
   if (await page.getByRole("button", { name: "Edit this row", exact: true }).count()) throw new Error("Browser did not default to read-only");
   await page.getByRole("button", { name: "Next page", exact: true }).click();

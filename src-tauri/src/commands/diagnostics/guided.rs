@@ -35,7 +35,7 @@ pub(super) fn guidance(check: &DiagnosticCheck, inspection: &Inspection) -> Opti
     }
     let (page, label, steps): (_, _, Vec<_>) = match check.code.as_str() {
         "artifact-missing" => ("artifact-install", "Open artifacts", vec![
-            "Choose the existing artifact folder containing FXServer.exe, or review an artifact installation.",
+            "Choose the existing artifact folder containing FXServer.exe or cfx-server.exe, or review an artifact installation.",
             "Rerun checks after correcting the artifact path. No executable is downloaded or launched by this check.",
         ]),
         "profile-invalid" | "profile-not-selected" | "txdata-missing" => ("server-manage", "Open server settings", vec![

@@ -12,7 +12,10 @@ use std::{
 use crate::{
     models::mariadb::MariaDBCredentials,
     process::CommandNoWindowExt,
-    services::mariadb::query::{apply_credentials_args, find_mariadb_client},
+    services::mariadb::{
+        native,
+        query::{apply_credentials_args, find_mariadb_client},
+    },
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -158,6 +161,22 @@ pub(crate) fn query_json<T: DeserializeOwned>(
         if sql.len() > 24000 {
             return Err("Query is too large. Reduce the number or length of filters.".into());
         }
+        if native::supported(credentials) {
+            match native::first_column(credentials, sql, MAX_OUTPUT) {
+                Ok(lines) => {
+                    return lines
+                        .iter()
+                        .filter(|line| !line.is_empty())
+                        .map(|line| {
+                            serde_json::from_str(line)
+                                .map_err(|e| format!("Invalid structured MariaDB result: {e}"))
+                        })
+                        .collect()
+                }
+                Err(native::NativeError::Server(message)) => return Err(message),
+                Err(native::NativeError::Unavailable) => {}
+            }
+        }
         let client = find_mariadb_client().ok_or("MariaDB client is unavailable.")?;
         let mut command = Command::new(client);
         command.no_window();
@@ -240,6 +259,31 @@ fn redacted_error(error: &str, password: &str) -> String {
     error.chars().take(4000).collect()
 }
 
+fn worker_result<T>(result: std::thread::Result<Result<T, String>>) -> Result<T, String> {
+    result.unwrap_or_else(|_| Err("Metadata worker failed.".to_string()))
+}
+
+fn columns_sql(database: &str, table: &str) -> String {
+    let schema = sql_text(database);
+    let name = sql_text(table);
+    format!("SELECT JSON_OBJECT('name',COLUMN_NAME,'columnType',COLUMN_TYPE,'nullable',IF(IS_NULLABLE='YES',JSON_EXTRACT('true','$'),JSON_EXTRACT('false','$')),'defaultValue',COLUMN_DEFAULT,'extra',EXTRA,'binary',IF(DATA_TYPE IN ('binary','varbinary','tinyblob','blob','mediumblob','longblob','bit','geometry'),JSON_EXTRACT('true','$'),JSON_EXTRACT('false','$'))) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA={schema} AND TABLE_NAME={name} ORDER BY ORDINAL_POSITION LIMIT 129;")
+}
+
+/// Column list only: enough to build a page query, one client run instead of four.
+fn browser_columns(
+    credentials: &MariaDBCredentials,
+    database: &str,
+    table: &str,
+) -> Result<Vec<BrowserColumn>, String> {
+    quote_identifier(database)?;
+    quote_identifier(table)?;
+    let columns: Vec<BrowserColumn> = query_json(credentials, &columns_sql(database, table))?;
+    if columns.is_empty() || columns.len() > 128 {
+        return Err("Browser supports tables with 1 to 128 columns.".into());
+    }
+    Ok(columns)
+}
+
 fn metadata(
     credentials: &MariaDBCredentials,
     database: &str,
@@ -249,12 +293,24 @@ fn metadata(
     quote_identifier(table)?;
     let schema = sql_text(database);
     let name = sql_text(table);
-    let kinds: Vec<String> = query_json(credentials, &format!("SELECT JSON_QUOTE(TABLE_TYPE) FROM information_schema.TABLES WHERE TABLE_SCHEMA={schema} AND TABLE_NAME={name};"))?;
+    let kinds_sql = format!("SELECT JSON_QUOTE(TABLE_TYPE) FROM information_schema.TABLES WHERE TABLE_SCHEMA={schema} AND TABLE_NAME={name};");
+    let columns_sql = columns_sql(database, table);
+    let indexes_sql = format!("SELECT JSON_OBJECT('name',INDEX_NAME,'column',COLUMN_NAME,'sequence',SEQ_IN_INDEX,'unique',IF(NON_UNIQUE=0,JSON_EXTRACT('true','$'),JSON_EXTRACT('false','$')),'indexType',INDEX_TYPE,'prefixLength',SUB_PART) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA={schema} AND TABLE_NAME={name} ORDER BY INDEX_NAME,SEQ_IN_INDEX LIMIT 1024;");
+    // Three independent client runs; doing them side by side costs one round trip instead of three.
+    let (kinds, columns, indexes) = std::thread::scope(|scope| {
+        let kinds = scope.spawn(|| query_json::<String>(credentials, &kinds_sql));
+        let columns = scope.spawn(|| query_json::<BrowserColumn>(credentials, &columns_sql));
+        let indexes = scope.spawn(|| query_json::<BrowserIndex>(credentials, &indexes_sql));
+        (
+            worker_result(kinds.join()),
+            worker_result(columns.join()),
+            worker_result(indexes.join()),
+        )
+    });
+    let (kinds, columns, indexes) = (kinds?, columns?, indexes?);
     if kinds != ["BASE TABLE"] {
         return Err("Choose an accessible base table. Views are not browsed.".into());
     }
-    let columns = query_json(credentials, &format!("SELECT JSON_OBJECT('name',COLUMN_NAME,'columnType',COLUMN_TYPE,'nullable',IF(IS_NULLABLE='YES',JSON_EXTRACT('true','$'),JSON_EXTRACT('false','$')),'defaultValue',COLUMN_DEFAULT,'extra',EXTRA,'binary',IF(DATA_TYPE IN ('binary','varbinary','tinyblob','blob','mediumblob','longblob','bit','geometry'),JSON_EXTRACT('true','$'),JSON_EXTRACT('false','$'))) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA={schema} AND TABLE_NAME={name} ORDER BY ORDINAL_POSITION LIMIT 129;"))?;
-    let indexes = query_json(credentials, &format!("SELECT JSON_OBJECT('name',INDEX_NAME,'column',COLUMN_NAME,'sequence',SEQ_IN_INDEX,'unique',IF(NON_UNIQUE=0,JSON_EXTRACT('true','$'),JSON_EXTRACT('false','$')),'indexType',INDEX_TYPE,'prefixLength',SUB_PART) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA={schema} AND TABLE_NAME={name} ORDER BY INDEX_NAME,SEQ_IN_INDEX LIMIT 1024;"))?;
     let mut value = BrowserMetadata {
         columns,
         indexes,
@@ -801,7 +857,7 @@ pub async fn get_database_browser_rows(
 ) -> Result<BrowserPage, String> {
     super::run_blocking(move || {
         let _guard = super::mariadb::database_access()?;
-        let columns = metadata(&credentials, &request.database, &request.table)?.columns;
+        let columns = browser_columns(&credentials, &request.database, &request.table)?;
         let page_size = bounded_page_size(request.page_size, columns.len());
         let sql = select_sql(&request, &columns, page_size + 1, false)?;
         let mut rows: Vec<Vec<Option<String>>> = query_json(&credentials, &sql)?;
@@ -857,7 +913,7 @@ pub async fn export_database_browser_csv(
         {
             return Err("Choose an absolute CSV output path.".into());
         }
-        let columns = metadata(&credentials, &request.database, &request.table)?.columns;
+        let columns = browser_columns(&credentials, &request.database, &request.table)?;
         let sql = select_sql(&request, &columns, MAX_EXPORT + 1, true)?;
         let mut rows: Vec<Vec<Option<String>>> = query_json(&credentials, &sql)?;
         let has_more = rows.len() > MAX_EXPORT;

@@ -7,6 +7,8 @@ use std::{
 
 #[path = "artifact/catalog.rs"]
 mod catalog;
+#[path = "artifact/enhanced.rs"]
+mod enhanced;
 static INSTALL_OPERATION: Mutex<()> = Mutex::new(());
 
 #[tauri::command]
@@ -18,10 +20,30 @@ pub async fn get_windows_artifact_catalog(
 
 use crate::{
     models::artifact::{
-        ArtifactInstallRequest, ArtifactInstallResult, ArtifactMetadata, InstalledArtifactInfo,
+        EnhancedArtifactCatalog, EnhancedInstallRequest, ArtifactInstallRequest, ArtifactInstallResult, ArtifactMetadata, InstalledArtifactInfo,
     },
     process::CommandNoWindowExt,
 };
+
+#[tauri::command]
+pub async fn get_enhanced_artifact_catalog() -> Result<EnhancedArtifactCatalog, String> {
+    super::run_blocking(enhanced::load_catalog).await
+}
+
+#[tauri::command]
+pub async fn install_enhanced_artifact(
+    manager: tauri::State<'_, super::fxserver::FxserverManager>,
+    request: EnhancedInstallRequest,
+) -> Result<ArtifactInstallResult, String> {
+    let manager = manager.inner().clone();
+    super::run_blocking(move || {
+        let _operation = INSTALL_OPERATION
+            .try_lock()
+            .map_err(|_| "Another artifact installation is in progress.")?;
+        manager.with_stopped_server(|| enhanced::install(request))
+    })
+    .await
+}
 
 #[tauri::command]
 pub async fn get_windows_artifact_metadata() -> Result<ArtifactMetadata, String> {
@@ -44,8 +66,9 @@ fn get_installed_windows_artifact_info_blocking(
     }
 
     let marker_path = destination.join(".fxserver-artifact-version");
-    let executable_path = destination.join("FXServer.exe");
-    let has_fxserver_executable = executable_path.exists();
+    let server_executable = super::server_exe::find_server_executable(&destination);
+    let has_fxserver_executable = server_executable.is_some();
+    let edition = server_executable.map(|(_, edition)| edition.as_str().to_string());
     let citizen_server_impl_path = find_citizen_server_impl(&destination);
     let version_info = citizen_server_impl_path
         .as_deref()
@@ -82,6 +105,7 @@ fn get_installed_windows_artifact_info_blocking(
             .and_then(|info| info.file_version.clone()),
         product_version: version_info.and_then(|info| info.product_version),
         has_fxserver_executable,
+        edition,
         detection_source: detection_source.to_string(),
     })
 }
@@ -326,6 +350,15 @@ fn install_windows_artifact_blocking(
     let destination = PathBuf::from(request.destination.trim());
     if destination.as_os_str().is_empty() {
         return Err("Choose a destination folder before installing artifacts.".to_string());
+    }
+
+    if let Some((_, super::server_exe::ServerEdition::Enhanced)) =
+        super::server_exe::find_server_executable(&destination)
+    {
+        return Err(
+            "This folder holds a FiveM for GTAV Enhanced server (cfx-server.exe). Installing a Legacy artifact here would mix two different server builds. Choose a different folder."
+                .to_string(),
+        );
     }
 
     fs::create_dir_all(&destination)

@@ -80,6 +80,8 @@ export interface TxDataProfilesResult {
 	dataPath: string;
 	profiles: string[];
 	hasRootLogs: boolean;
+	/** True when the chosen folder itself contains config.json, i.e. it is a profile folder. */
+	hasRootConfig?: boolean;
 }
 
 export interface ServerConfigRequest {

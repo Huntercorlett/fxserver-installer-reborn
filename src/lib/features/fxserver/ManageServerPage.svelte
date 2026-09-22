@@ -97,7 +97,7 @@
 	} from "$lib/modules/fxserver";
 	import TxHostFieldInput from "./TxHostFieldInput.svelte";
 	import { sensitiveTxHostKeys, txHostFields, txHostGroups } from "./fxserverEnv";
-	import { fxserverSettings, loadFxserverSettings, readSavedEnvironment, refreshTxDataProfiles, setServerProfile, setTxDataPath, writeSavedEnvironment } from "./fxserverSettings.svelte";
+	import { fxserverSettings, loadFxserverSettings, readSavedEnvironment, defaultTxDataPath, refreshTxDataProfiles, setServerProfile, setTxDataPath, useDefaultTxData, writeSavedEnvironment } from "./fxserverSettings.svelte";
 
 	type MetricWindow = "30s" | "5m" | "10m" | "30m" | "1h";
 	type ResourceSample = {
@@ -875,7 +875,7 @@
 					</div>
 					<div>
 						<Card.Title>Artifact Path</Card.Title>
-						<Card.Description>Use the saved artifact folder or choose the folder that contains FXServer.exe.</Card.Description>
+						<Card.Description>Use the saved artifact folder or choose the folder that contains FXServer.exe (FiveM) or cfx-server.exe (FiveM for GTAV Enhanced).</Card.Description>
 					</div>
 				</div>
 			</Card.Header>
@@ -883,7 +883,7 @@
 				<div class="grid gap-3 md:grid-cols-[1fr_auto]">
 					<label class="grid gap-2">
 						<span class="text-xs font-medium text-muted-foreground">Artifact Folder</span>
-						<Input value={artifactPath} oninput={updateArtifactPath} placeholder="C:\FXServer\server" title="Folder that contains FXServer.exe" class="rounded-sm font-mono" />
+						<Input value={artifactPath} oninput={updateArtifactPath} placeholder="C:\FXServer\server" title="Folder that contains FXServer.exe or cfx-server.exe" class="rounded-sm font-mono" />
 					</label>
 					<div class="flex items-end">
 						<Button variant="outline" onclick={chooseFolder} disabled={starting || stopping} title="Pick the FXServer artifact folder">
@@ -936,7 +936,7 @@
 		</Card.Header>
 		<Card.Content class="space-y-4">
 			<div class="flex flex-wrap items-center gap-2">
-				<Button onclick={() => startServer()} disabled={!canStart} aria-busy={starting} title="Start FXServer.exe with the configured TXHOST variables">
+				<Button onclick={() => startServer()} disabled={!canStart} aria-busy={starting} title="Start the server executable with the configured TXHOST variables">
 					{#if starting}
 						<LoaderCircleIcon class="animate-spin" />
 					{:else}
@@ -1268,8 +1268,8 @@
 						<span class="text-xs font-semibold text-sky-100">txData Path</span>
 						<span class="font-mono text-[10px] text-sky-200/70">TXHOST_DATA_PATH</span>
 					</span>
-					<span class="text-xs leading-5 text-muted-foreground">Shared txData folder used for profile detection and server log browsing.</span>
-					<div class="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+					<span class="text-xs leading-5 text-muted-foreground">Shared txData folder used for profile detection and server log browsing. It follows the artifact folder automatically (one level up, in a txData folder) until you pick your own.</span>
+					<div class="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
 						<Input
 							value={envValues.TXHOST_DATA_PATH ?? ""}
 							oninput={(event) => {
@@ -1286,6 +1286,9 @@
 							<FolderOpenIcon />
 							Browse
 						</Button>
+						{#if !fxserverSettings.txDataAuto && defaultTxDataPath(artifactPath)}
+							<Button variant="outline" onclick={useDefaultTxData} title={`Use ${defaultTxDataPath(artifactPath)}`}>Use default</Button>
+						{/if}
 					</div>
 				</label>
 

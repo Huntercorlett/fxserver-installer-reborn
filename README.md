@@ -10,7 +10,7 @@ Quick note: The main purpose of this app was for me to learn how to build with T
 > FXServer Installer is a new project in active development. Issues, bugs, UI changes, and breaking changes may happen between releases, so back up important server data before using app features that install, update, uninstall, or rewrite files.
 
 > [!WARNING]
-> **Version 0.4.1 is a beta, not a fully tested production release.** Automated checks do not replace live Windows Server, MariaDB upgrade/restore, or FXServer load testing. Test on a disposable server and keep independent backups. See the [0.4.1 beta release notes](docs/releases/v0.4.1.md) for changes and validation limits.
+> **Version 0.4.2 is a beta, not a fully tested production release.** Automated checks do not replace live Windows Server, MariaDB upgrade/restore, or FXServer load testing. Test on a disposable server and keep independent backups. See [PATCH-NOTES.md](PATCH-NOTES.md) for what changed since 0.4.1.
 
 > [!NOTE]
 > Windows SmartScreen may warn because this project is new and currently unsigned. If you downloaded it from the official GitHub Releases page, click "More info" and then "Run anyway".
@@ -166,6 +166,21 @@ Quick note: The main purpose of this app was for me to learn how to build with T
 - Run `start`, `stop`, `restart`, and `ensure` through RCON.
 - Exclude CitizenFX and `[cfx-default]` resources from update checks.
 - Show actual runtime state badges only when Live Bridge is connected to the active workspace. RCON success alone never establishes a resource's state.
+
+### FiveM for GTAV Enhanced
+
+- Manage Server, Diagnostics, resource scanning, and process monitoring recognise `cfx-server.exe` (FiveM for GTAV Enhanced) as well as `FXServer.exe`, so an extracted Enhanced artifact can be started, stopped, and restarted like a Legacy one.
+- Installed-artifact detection reports the edition. Enhanced folders skip the JG Scripts Legacy recommendation and issue list, and Legacy installs into a folder containing `cfx-server.exe` are blocked so two server builds are never mixed.
+- Enhanced server files are downloaded from the Enhanced tab of the Cfx.re Server Download page; the in-app installer still installs Legacy artifacts only.
+
+### Website Hosting
+
+- Serve one or more website folders on any port from **Website Hosting**, with independent Start/Stop, an "open in browser" button, and a live recent-requests view.
+- Static files only: HTML, CSS, JavaScript, images, fonts, and media. PHP, Node, and other server-side code is not executed.
+- Choose "This computer only" (127.0.0.1) or "Other devices / internet" (all network interfaces). Network mode shows the LAN address and a ready-to-copy Windows Firewall command; router port forwarding is still up to you.
+- Optional single-page-app mode, optional start-with-app, index.html/404.html support, ETag caching, and byte-range requests for video and audio.
+- Safe by default: requests cannot leave the site folder (including through links), hidden files such as `.git`/`.env` are never served, and scripts/config-like files (`.php`, `.py`, `.sh`, `.bat`, `.cfg`, `.ini`, `.env`, `.sql`, `.log`, `.bak`, and similar) are refused so their contents cannot leak.
+- Websites run inside the app, so they stay online while it is open or in the tray, and stop when you quit. Settings are saved per computer, not per workspace.
 
 ### Logs
 

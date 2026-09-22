@@ -13,6 +13,8 @@
 	import FxserverLogsPage from "$lib/features/fxserver/FxserverLogsPage.svelte";
 	import HomePage from "$lib/features/home/HomePage.svelte";
 	import TaskCenterPage from "$lib/features/tasks/TaskCenterPage.svelte";
+	import CreditsPage from "$lib/features/credits/CreditsPage.svelte";
+	import WebsiteHostingPage from "$lib/features/website/WebsiteHostingPage.svelte";
 	import WorkspacesPage from "$lib/features/workspaces/WorkspacesPage.svelte";
 	import { initializeWorkspaces, workspaceSession } from "$lib/core/workspaces.svelte";
 	import ManageServerPage from "$lib/features/fxserver/ManageServerPage.svelte";
@@ -22,7 +24,6 @@
 	import JsonFormatterPage from "$lib/features/json/JsonFormatterPage.svelte";
 	import LogViewerPage from "$lib/features/app-logs/LogViewerPage.svelte";
 	import MariaDBPanel from "$lib/features/mariadb/MariaDBPanel.svelte";
-	import SqlRunnerPage from "$lib/features/mariadb/SqlRunnerPage.svelte";
 	import PlaceholderPage from "$lib/features/placeholder/PlaceholderPage.svelte";
 	import ProfilerPage from "$lib/features/profiler/ProfilerPage.svelte";
 	import ArrowDownIcon from "@lucide/svelte/icons/arrow-down";
@@ -57,13 +58,13 @@
 			| "incidents"
 			| "onboarding"
 			| "mariadb"
-			| "sql-runner"
 			| "artifact-install"
 			| "artifact-info"
 			| "server-manage"
 			| "resource-manager"
 			| "server-configure"
 			| "server-logs"
+			| "website"
 			| "command-palette"
 			| "json-formatter"
 			| "profiler"
@@ -71,6 +72,7 @@
 			| "logs"
 			| "client-logs"
 			| "configurator"
+			| "credits"
 		>,
 		string
 	> = {};
@@ -198,8 +200,6 @@
 					<OnboardingPage onNavigate={navigate} />
 				{:else if activePage === "mariadb"}
 					<MariaDBPanel />
-				{:else if activePage === "sql-runner"}
-					<SqlRunnerPage />
 				{:else if activePage === "artifact-install"}
 					<ArtifactInstallPage />
 				{:else if activePage === "artifact-info"}
@@ -212,6 +212,8 @@
 					<ConfigureServerPage />
 				{:else if activePage === "server-logs"}
 					<FxserverLogsPage />
+				{:else if activePage === "website"}
+					<WebsiteHostingPage />
 				{:else if activePage === "json-formatter"}
 					<JsonFormatterPage />
 				{:else if activePage === "profiler"}
@@ -226,6 +228,8 @@
 					<CommandPalettePage />
 				{:else if activePage === "configurator"}
 					<ConfiguratorPage />
+				{:else if activePage === "credits"}
+					<CreditsPage />
 				{:else}
 					<PlaceholderPage title={getPageLabel(activePage)} description={placeholders[activePage]} />
 				{/if}

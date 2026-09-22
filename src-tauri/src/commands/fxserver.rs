@@ -28,6 +28,7 @@ use crate::{
     FXSERVER_WATCHDOG_ARG,
 };
 
+const NO_SERVER_EXECUTABLE: &str = "No server executable was found in the selected artifact folder. Expected FXServer.exe (FiveM) or cfx-server.exe (FiveM for GTAV Enhanced).";
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(4);
 const FORCE_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 static RCON_PASSWORD_LOCK: Mutex<()> = Mutex::new(());
@@ -499,10 +500,10 @@ fn start_fxserver_blocking(
         return Err("Choose an FXServer artifact folder before starting the server.".to_string());
     }
 
-    let executable_path = artifact_path.join("FXServer.exe");
-    if !executable_path.is_file() {
-        return Err("FXServer.exe was not found in the selected artifact folder.".to_string());
-    }
+    let Some((executable_path, _)) = super::server_exe::find_server_executable(&artifact_path)
+    else {
+        return Err(NO_SERVER_EXECUTABLE.to_string());
+    };
 
     let mut command = Command::new(&executable_path);
     command.no_window();
@@ -529,7 +530,7 @@ fn start_fxserver_blocking(
         .map_err(|_| "FXServer process state is unavailable.".to_string())?;
     let mut child = command
         .spawn()
-        .map_err(|error| format!("Failed to start FXServer.exe: {error}"))?;
+        .map_err(|error| format!("Failed to start the server executable: {error}"))?;
     let pid = child.id();
     let started_at = SystemTime::now();
     let started_at_label = system_time_to_label(started_at);
@@ -575,7 +576,11 @@ fn start_fxserver_blocking(
         &manager.terminal,
         "system",
         format!(
-            "Started FXServer.exe from {}",
+            "Started {} from {}",
+            executable_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "the server".to_string()),
             artifact_path.to_string_lossy()
         ),
     );
@@ -628,11 +633,10 @@ pub async fn restart_fxserver(
             .lifecycle
             .try_lock()
             .map_err(|_| "Another FXServer action is in progress.".to_string())?;
-        if !Path::new(request.artifact_path.trim())
-            .join("FXServer.exe")
-            .is_file()
+        if super::server_exe::find_server_executable(Path::new(request.artifact_path.trim()))
+            .is_none()
         {
-            return Err("FXServer.exe was not found in the selected artifact folder.".to_string());
+            return Err(NO_SERVER_EXECUTABLE.to_string());
         }
         request.environment = sanitize_environment(request.environment)?;
         manager.disarm_recovery();
@@ -949,6 +953,18 @@ fn list_txdata_profiles_blocking(data_path: String) -> Result<TxDataProfilesResu
         return Err("Choose a txData folder before scanning profiles.".to_string());
     }
 
+    if !data_path.exists() {
+        // txData is created by fxserver.exe/cfx-server.exe on its first run, so it's normal for
+        // this folder to be missing before the server has ever been started. Treat that as "no
+        // profiles yet" instead of a hard error.
+        return Ok(TxDataProfilesResult {
+            data_path: data_path.to_string_lossy().to_string(),
+            profiles: Vec::new(),
+            has_root_logs: false,
+            has_root_config: false,
+        });
+    }
+
     let entries = fs::read_dir(&data_path)
         .map_err(|error| format!("Failed to inspect {}: {error}", data_path.to_string_lossy()))?;
     let mut profiles = Vec::new();
@@ -977,6 +993,7 @@ fn list_txdata_profiles_blocking(data_path: String) -> Result<TxDataProfilesResu
         data_path: data_path.to_string_lossy().to_string(),
         profiles,
         has_root_logs: data_path.join("logs").is_dir(),
+        has_root_config: data_path.join("config.json").is_file(),
     })
 }
 
@@ -2257,7 +2274,7 @@ fn windows_fxserver_processes(root_pid: u32) -> Result<Vec<WindowsProcessInfo>, 
     let processes = windows_process_tree(root_pid)?;
     Ok(processes
         .into_iter()
-        .filter(|process| process.exe_name.eq_ignore_ascii_case("fxserver.exe"))
+        .filter(|process| super::server_exe::is_server_process_name(&process.exe_name))
         .collect())
 }
 

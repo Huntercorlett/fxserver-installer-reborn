@@ -4,7 +4,7 @@ use tauri::{AppHandle, Emitter};
 use crate::{
     models::mariadb::{
         MariaDBBackupOptions, MariaDBBackupResult, MariaDBCredentials, MariaDBInstallOptions,
-        MariaDBPackageInfo, MariaDBQueryResult, MariaDBStatus, MariaDBUser, MariaDBUserAccess,
+        MariaDBPackageInfo, MariaDBQueryResult, MariaDBRelease, MariaDBSeries, MariaDBStatus, MariaDBUser, MariaDBUserAccess,
         MariaDBUserConfig, MariaDBUserUpdateConfig,
     },
     services::mariadb::{
@@ -33,6 +33,8 @@ pub(crate) fn database_access() -> Result<RwLockReadGuard<'static, ()>, String> 
 }
 
 pub(crate) fn maintenance_access() -> Result<RwLockWriteGuard<'static, ()>, String> {
+    // Service changes and restores invalidate any pooled connections.
+    crate::services::mariadb::native::reset();
     DATABASE_ACCESS.try_write()
         .map_err(|_| "A MariaDB operation is in progress. Wait for backups, restores, and queries to finish before changing the service.".into())
 }
@@ -43,16 +45,25 @@ async fn run_installer(
 ) -> Result<String, String> {
     super::run_blocking(move || {
         let _guard = maintenance_access()?;
-        task(&|stage| {
+        crate::services::mariadb::detect::clear_detection_cache();
+        let result = task(&|stage| {
             let _ = app.emit("mariadb-progress", stage);
-        })
+        });
+        crate::services::mariadb::detect::clear_detection_cache();
+        result
     })
     .await
 }
 
 #[tauri::command]
-pub async fn get_mariadb_status() -> Result<MariaDBStatus, String> {
-    super::run_blocking(|| Ok(detect_mariadb())).await
+pub async fn get_mariadb_status(refresh: Option<bool>) -> Result<MariaDBStatus, String> {
+    super::run_blocking(move || {
+        if refresh == Some(true) {
+            crate::services::mariadb::detect::clear_detection_cache();
+        }
+        Ok(detect_mariadb())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -68,6 +79,16 @@ pub async fn get_mariadb_package_info() -> Result<MariaDBPackageInfo, String> {
     tauri::async_runtime::spawn_blocking(get_package_info)
         .await
         .map_err(|error| format!("MariaDB package info task failed: {error}"))
+}
+
+#[tauri::command]
+pub async fn list_mariadb_versions() -> Result<Vec<MariaDBSeries>, String> {
+    super::run_blocking(crate::services::mariadb::package::list_series).await
+}
+
+#[tauri::command]
+pub async fn list_mariadb_releases(series: String) -> Result<Vec<MariaDBRelease>, String> {
+    super::run_blocking(move || crate::services::mariadb::package::list_releases(&series)).await
 }
 
 #[tauri::command]

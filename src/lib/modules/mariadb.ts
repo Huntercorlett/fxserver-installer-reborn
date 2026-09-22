@@ -22,6 +22,8 @@ export interface MariaDBCredentials {
 }
 
 export interface MariaDBInstallOptions {
+	/** Series ("11.4") or exact release ("11.4.5"). Empty installs the default 10.11 LTS. */
+	version?: string | null;
 	rootPassword: string;
 	serviceName: string;
 	port: number;
@@ -36,6 +38,18 @@ export interface MariaDBInstallOptions {
 	bufferPoolSize?: string | null;
 	installHeidiSql: boolean;
 	installDevelopmentFiles: boolean;
+}
+
+export interface MariaDBSeries {
+	series: string;
+	status?: string | null;
+	support?: string | null;
+	eol?: string | null;
+}
+
+export interface MariaDBRelease {
+	version: string;
+	date?: string | null;
 }
 
 export interface MariaDBPackageInfo {
@@ -187,7 +201,7 @@ export function getMariaDBStatus(force = false) {
 		return Promise.resolve(cacheStatus(browserPreviewStatus()));
 	}
 
-	return invokeMariaDB<MariaDBStatus>("get_mariadb_status", {}, force ? "MariaDB status refresh" : "MariaDB initial status load", (status) =>
+	return invokeMariaDB<MariaDBStatus>("get_mariadb_status", { refresh: force }, force ? "MariaDB status refresh" : "MariaDB initial status load", (status) =>
 		status.installed ? `MariaDB detected${status.version ? `: ${status.version}` : "."}` : "MariaDB is not installed.",
 	).then(cacheStatus);
 }
@@ -229,6 +243,16 @@ export function getMariaDBPackageInfo() {
 	return invokeMariaDB<MariaDBPackageInfo>("get_mariadb_package_info", {}, "MariaDB package info refresh", (info) =>
 		info.latestVersion ? `Recommended MariaDB version is ${info.latestVersion}.` : "MariaDB package info refreshed.",
 	);
+}
+
+export function listMariaDBVersions() {
+	if (!hasTauriRuntime()) return Promise.resolve<MariaDBSeries[]>([]);
+	return invoke<MariaDBSeries[]>("list_mariadb_versions", {});
+}
+
+export function listMariaDBReleases(series: string) {
+	if (!hasTauriRuntime()) return Promise.resolve<MariaDBRelease[]>([]);
+	return invoke<MariaDBRelease[]>("list_mariadb_releases", { series });
 }
 
 export function uninstallMariaDB() {

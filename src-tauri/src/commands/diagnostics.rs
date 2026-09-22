@@ -296,14 +296,16 @@ fn inspect(request: &PreflightRequest) -> Inspection {
         }
     }
     let artifact = Path::new(request.artifact_path.trim());
-    if !request.artifact_path.trim().is_empty() && artifact.join("FXServer.exe").is_file() {
+    if !request.artifact_path.trim().is_empty()
+        && super::server_exe::find_server_executable(artifact).is_some()
+    {
         check(
             &mut inspection,
             "Paths",
             "artifact-found",
             Severity::Pass,
             "FXServer executable",
-            "FXServer.exe is present in the artifact directory.",
+            "A server executable (FXServer.exe or cfx-server.exe) is present in the artifact directory.",
         );
     } else {
         check(
@@ -312,14 +314,14 @@ fn inspect(request: &PreflightRequest) -> Inspection {
             "artifact-missing",
             Severity::Error,
             "FXServer executable missing",
-            "Install an artifact or choose the directory containing FXServer.exe.",
+            "Install an artifact or choose the directory containing FXServer.exe (or cfx-server.exe for FiveM for GTAV Enhanced).",
         );
     }
     if request.profile.trim().is_empty() {
         if !request.tx_data_path.trim().is_empty()
             && !Path::new(request.tx_data_path.trim()).is_dir()
         {
-            check(&mut inspection, "Paths", "txdata-missing", Severity::Error, "Configured txData directory missing", "The configured txData directory does not exist. Correct the path or clear it for a fresh txAdmin setup.");
+            check(&mut inspection, "Paths", "txdata-missing", Severity::Warning, "Configured txData directory missing", "The configured txData directory does not exist yet. It's created automatically on first run if this is a fresh txAdmin setup — otherwise correct the path.");
         } else {
             check(&mut inspection, "Paths", "profile-not-selected", Severity::Warning, "No txAdmin profile selected", "FXServer can open txAdmin for initial setup. Select a profile afterward to check server configs, resources, and ports.");
         }
@@ -476,7 +478,9 @@ struct ResourceScan {
 }
 
 fn scan_artifact_resources(artifact: &Path, scan: &mut ResourceScan, inspection: &mut Inspection) {
-    if artifact.as_os_str().is_empty() || !artifact.join("FXServer.exe").is_file() {
+    if artifact.as_os_str().is_empty()
+        || super::server_exe::find_server_executable(artifact).is_none()
+    {
         return;
     }
     // ServerResources.cpp scans data/resources, then citizen_dir/system_resources.

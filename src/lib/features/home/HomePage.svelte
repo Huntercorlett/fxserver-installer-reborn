@@ -175,7 +175,6 @@
 			]}
 			actions={[
 				{ label: "Manage", onclick: () => onNavigate("mariadb") },
-				{ label: "Queries & Files", onclick: () => onNavigate("sql-runner") },
 				{ label: "Backups & Restore", onclick: () => onNavigate("backup-manager") },
 				{ label: "Browse Data", onclick: () => onNavigate("database-browser") },
 			]}

@@ -36,6 +36,10 @@
 		void register(listen<BridgeStatus>("live-bridge-update", ({ payload }) => acceptBridgeStatus(payload)));
 		void register(listen<Parameters<typeof appendHealthIncident>[0]>("fxserver-health-event", ({ payload }) => appendHealthIncident(payload)));
 		void register(listen<{ id: number; workspaceId: string; timestamp: number; level: "warn" | "error"; message: string }[]>("fxserver-console-incidents", ({ payload }) => {
+			const sqlFailure = payload.find((entry) => /errno:?\s*150|foreign key constraint is incorrectly formed|ER_CANT_CREATE_TABLE|error 1005/i.test(entry.message));
+			if (sqlFailure && !alerts.some((item) => item.scope === "fxserver.sql")) {
+				alerts = [...alerts.slice(-2), { id: `sql-fk:${sqlFailure.timestamp}:${sqlFailure.id}`, level: "warn", scope: "fxserver.sql", message: "A resource's SQL failed with a foreign key / collation error. Open MariaDB → Database Browser → Import, pick the database, and press Generate collation fix." }];
+			}
 			appendIncidents(payload.map((entry) => ({ id: `console:${entry.timestamp}:${entry.id}`, timestamp: entry.timestamp, workspaceId: entry.workspaceId,
 				level: entry.level, title: entry.message, type: "log", panel: "server-manage" })));
 		}));
@@ -46,7 +50,7 @@
 {#if alerts.length}
 	<div class="fixed top-12 right-4 z-50 grid w-96 max-w-[calc(100vw-6rem)] gap-2" aria-label="Background notifications">
 		{#each alerts as alert (alert.id)}
-			<Notice tone={alert.level === "error" ? "error" : "warn"} title={alert.scope === "fxserver.health" ? "Server health" : "Background task"} message={alert.message} class="bg-card shadow-lg" onDismiss={() => alerts = alerts.filter((item) => item.id !== alert.id)} />
+			<Notice tone={alert.level === "error" ? "error" : "warn"} title={alert.scope === "fxserver.health" ? "Server health" : alert.scope === "fxserver.sql" ? "Database collation" : "Background task"} message={alert.message} class="bg-card shadow-lg" onDismiss={() => alerts = alerts.filter((item) => item.id !== alert.id)} />
 		{/each}
 	</div>
 {/if}

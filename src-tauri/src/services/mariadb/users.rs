@@ -48,8 +48,7 @@ pub fn create_or_update_user(
     let create_user = format!("CREATE USER IF NOT EXISTS {user} IDENTIFIED BY {password};");
     run_admin_query(credentials.clone(), create_user)?;
 
-    let alter_user = format!("ALTER USER {user} IDENTIFIED BY {password};");
-    run_admin_query(credentials.clone(), alter_user)?;
+    apply_password(&credentials, &user, &password)?;
 
     if let Some(database) = config.database.filter(|value| !value.trim().is_empty()) {
         grant_permissions(
@@ -64,6 +63,24 @@ pub fn create_or_update_user(
     run_admin_query(credentials, "FLUSH PRIVILEGES;".to_string())
 }
 
+/// Node's mysql2 driver (txAdmin, oxmysql) cannot log in with the newer default plugins of recent
+/// MariaDB releases, so prefer mysql_native_password and only fall back to the server default.
+fn apply_password(
+    credentials: &MariaDBCredentials,
+    user: &str,
+    password: &str,
+) -> Result<(), String> {
+    let native =
+        format!("ALTER USER {user} IDENTIFIED VIA mysql_native_password USING PASSWORD({password});");
+    if run_admin_query(credentials.clone(), native).is_ok() {
+        return Ok(());
+    }
+    run_admin_query(
+        credentials.clone(),
+        format!("ALTER USER {user} IDENTIFIED BY {password};"),
+    )
+}
+
 pub fn update_user(
     credentials: MariaDBCredentials,
     config: MariaDBUserUpdateConfig,
@@ -71,11 +88,7 @@ pub fn update_user(
     let user = account(&config.username, &config.host);
 
     if let Some(password) = config.password.filter(|value| !value.trim().is_empty()) {
-        let alter_user = format!(
-            "ALTER USER {user} IDENTIFIED BY {};",
-            escape_string(&password)
-        );
-        run_admin_query(credentials.clone(), alter_user)?;
+        apply_password(&credentials, &user, &escape_string(&password))?;
     }
 
     if let Some(database) = config.database.filter(|value| !value.trim().is_empty()) {

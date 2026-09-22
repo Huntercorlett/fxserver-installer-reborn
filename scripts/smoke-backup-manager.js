@@ -74,8 +74,8 @@ async (page) => {
     await page.getByText("Project", { exact: true }).waitFor();
   };
   await openBackups();
-  await page.getByRole("button", { name: "Change Credentials", exact: true }).click();
-  await page.getByText("Credentials validated.", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  await page.getByText("Connected", { exact: true }).waitFor();
   await page.getByRole("textbox", { name: "Name", exact: true }).fill("Hourly test");
   await page.getByRole("textbox", { name: "Backup folder", exact: true }).fill("C:/mock/backups");
   await page.getByRole("button", { name: "Save Schedule", exact: true }).click();

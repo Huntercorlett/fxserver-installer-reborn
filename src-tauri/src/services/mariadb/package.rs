@@ -1,6 +1,7 @@
 use super::install::{run_process, InstallOutput};
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
@@ -13,25 +14,34 @@ pub(super) struct Package {
     pub sha256: String,
 }
 
-static CACHE: OnceLock<Mutex<Option<(Instant, Package)>>> = OnceLock::new();
+static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Package)>>> = OnceLock::new();
 
-pub(super) fn latest_package() -> Result<Package, String> {
+/// `requested` is `None` (default 10.11 LTS), a series such as `11.4`, or an exact release such as `11.4.5`.
+pub(super) fn resolve_package(requested: Option<&str>) -> Result<Package, String> {
+    let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(value) = requested {
+        if !valid_series(value) && !valid_release(value) {
+            return Err("MariaDB version must look like 10.11 or 10.11.14.".to_string());
+        }
+    }
+    let key = requested.unwrap_or_default().to_string();
     let mut cached = CACHE
-        .get_or_init(|| Mutex::new(None))
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|_| "MariaDB package cache is unavailable.".to_string())?;
-    if let Some((time, package)) = &*cached {
+    if let Some((time, package)) = cached.get(&key) {
         if time.elapsed() < Duration::from_secs(15 * 60) {
             return Ok(package.clone());
         }
     }
+    let script = format!(
+        "$requested = '{}'\n{}",
+        requested.unwrap_or_default(),
+        include_str!("package-metadata.ps1")
+    );
     let output = run_process(
         "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            include_str!("package-metadata.ps1"),
-        ],
+        &["-NoProfile", "-Command", &script],
         Duration::from_secs(75),
     )?;
     if !output.success {
@@ -40,12 +50,74 @@ pub(super) fn latest_package() -> Result<Package, String> {
             output.stderr
         ));
     }
-    let package = parse_package(&output.stdout)?;
-    *cached = Some((Instant::now(), package.clone()));
+    let package = parse_package(&output.stdout, requested)?;
+    cached.insert(key, (Instant::now(), package.clone()));
     Ok(package)
 }
 
-fn parse_package(json: &str) -> Result<Package, String> {
+fn valid_series(value: &str) -> bool {
+    let parts: Vec<_> = value.split('.').collect();
+    parts.len() == 2 && parts.iter().all(|part| is_number(part))
+}
+
+fn valid_release(value: &str) -> bool {
+    let parts: Vec<_> = value.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|part| is_number(part))
+}
+
+fn is_number(part: &str) -> bool {
+    !part.is_empty() && part.len() <= 4 && part.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[derive(Clone, Deserialize, serde::Serialize)]
+pub struct MariaDBSeries {
+    pub series: String,
+    pub status: Option<String>,
+    pub support: Option<String>,
+    pub eol: Option<String>,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize)]
+pub struct MariaDBRelease {
+    pub version: String,
+    pub date: Option<String>,
+}
+
+fn run_listing<T: serde::de::DeserializeOwned>(series: Option<&str>) -> Result<Vec<T>, String> {
+    let script = format!(
+        "$series = '{}'\n{}",
+        series.unwrap_or_default(),
+        include_str!("package-versions.ps1")
+    );
+    let output = run_process(
+        "powershell",
+        &["-NoProfile", "-Command", &script],
+        Duration::from_secs(75),
+    )?;
+    if !output.success {
+        return Err(format!(
+            "Could not load MariaDB versions: {}",
+            output.stderr
+        ));
+    }
+    serde_json::from_str(&output.stdout)
+        .map_err(|error| format!("Invalid MariaDB version listing: {error}"))
+}
+
+pub(crate) fn list_series() -> Result<Vec<MariaDBSeries>, String> {
+    let list: Vec<MariaDBSeries> = run_listing(None)?;
+    Ok(list.into_iter().filter(|item| valid_series(&item.series)).collect())
+}
+
+pub(crate) fn list_releases(series: &str) -> Result<Vec<MariaDBRelease>, String> {
+    if !valid_series(series) {
+        return Err("MariaDB series must look like 10.11.".to_string());
+    }
+    let list: Vec<MariaDBRelease> = run_listing(Some(series))?;
+    Ok(list.into_iter().filter(|item| valid_release(&item.version)).collect())
+}
+
+fn parse_package(json: &str, requested: Option<&str>) -> Result<Package, String> {
     let package: Package = serde_json::from_str(json)
         .map_err(|error| format!("Invalid MariaDB download metadata: {error}"))?;
     let valid_version = package.version.split('.').count() == 3
@@ -62,6 +134,19 @@ fn parse_package(json: &str) -> Result<Package, String> {
             "MariaDB download metadata did not contain a valid Windows MSI and SHA-256."
                 .to_string(),
         );
+    }
+    if let Some(requested) = requested {
+        let matches = if valid_release(requested) {
+            package.version == requested
+        } else {
+            package.version.starts_with(&format!("{requested}."))
+        };
+        if !matches {
+            return Err(format!(
+                "MariaDB returned version {} instead of the requested {requested}.",
+                package.version
+            ));
+        }
     }
     Ok(package)
 }
@@ -119,7 +204,7 @@ mod tests {
     #[test]
     fn rejects_unverified_or_unexpected_installers() {
         let valid = serde_json::json!({"version": "12.3.3", "file_name": "mariadb-12.3.3-winx64.msi", "sha256": "a".repeat(64)});
-        assert!(parse_package(&valid.to_string()).is_ok());
+        assert!(parse_package(&valid.to_string(), None).is_ok());
         for (field, value) in [
             ("sha256", ""),
             ("file_name", "../other.msi"),
@@ -127,14 +212,25 @@ mod tests {
         ] {
             let mut bad = valid.clone();
             bad[field] = value.into();
-            assert!(parse_package(&bad.to_string()).is_err());
+            assert!(parse_package(&bad.to_string(), None).is_err());
         }
+    }
+
+    #[test]
+    fn rejects_a_package_that_is_not_the_requested_version() {
+        let json = serde_json::json!({"version": "11.4.5", "file_name": "mariadb-11.4.5-winx64.msi", "sha256": "a".repeat(64)}).to_string();
+        assert!(parse_package(&json, Some("11.4")).is_ok());
+        assert!(parse_package(&json, Some("11.4.5")).is_ok());
+        assert!(parse_package(&json, Some("11.8")).is_err());
+        assert!(parse_package(&json, Some("11.4.4")).is_err());
+        assert!(!valid_series("11.4'; calc"));
+        assert!(!valid_release("11.4"));
     }
 
     #[test]
     #[ignore = "downloads the official MSI without installing it"]
     fn downloads_and_verifies_official_msi() {
-        let package = latest_package().expect("official metadata");
+        let package = resolve_package(None).expect("official metadata");
         let path =
             std::env::temp_dir().join(format!("fxi-package-test-{}.msi", std::process::id()));
         let output = download_package(&package, &path);

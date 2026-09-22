@@ -1,4 +1,5 @@
 mod commands;
+mod credits;
 mod models;
 mod process;
 mod services;
@@ -81,6 +82,7 @@ pub fn run_fxserver_watchdog_from_args() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    credits::enforce();
     exit_if_secondary_instance();
 
     tauri::Builder::default()
@@ -88,13 +90,17 @@ pub fn run() {
         .manage(commands::backup_manager::BackupManager::default())
         .manage(commands::health::HealthMonitor::default())
         .manage(commands::live_bridge::LiveBridge::default())
+        .manage(commands::website::WebsiteManager::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            credits::get_credits,
             commands::app_release::fetch_latest_app_release,
             commands::artifact::get_windows_artifact_metadata,
             commands::artifact::get_windows_artifact_catalog,
             commands::artifact::get_installed_windows_artifact_info,
             commands::artifact::install_windows_artifact,
+            commands::artifact::get_enhanced_artifact_catalog,
+            commands::artifact::install_enhanced_artifact,
             commands::backup_manager::get_backup_manager,
             commands::backup_manager::save_backup_schedule,
             commands::backup_manager::remove_backup_schedule,
@@ -165,9 +171,16 @@ pub fn run() {
             commands::logs::read_client_logs,
             commands::system::open_external_url,
             commands::system::read_text_file,
+            commands::database_admin::list_table_info,
+            commands::database_admin::run_table_action,
+            commands::database_admin::create_table,
+            commands::database_admin::create_database,
+            commands::database_admin::drop_database,
             commands::mariadb::get_mariadb_status,
             commands::mariadb::get_mariadb_package_info,
             commands::mariadb::install_mariadb,
+            commands::mariadb::list_mariadb_versions,
+            commands::mariadb::list_mariadb_releases,
             commands::mariadb::uninstall_mariadb,
             commands::mariadb::update_mariadb,
             commands::mariadb::start_mariadb_service,
@@ -184,6 +197,16 @@ pub fn run() {
             commands::mariadb::get_mariadb_user_access,
             commands::mariadb::grant_mariadb_permissions,
             commands::mariadb::delete_mariadb_user,
+            commands::website::get_website_sites,
+            commands::website::save_website_site,
+            commands::website::remove_website_site,
+            commands::website::start_website_site,
+            commands::website::stop_website_site,
+            commands::website::get_website_requests,
+            commands::website::list_website_pages,
+            commands::database_login::save_mariadb_login,
+            commands::database_login::load_mariadb_login,
+            commands::database_login::clear_mariadb_login,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -200,6 +223,8 @@ pub fn run() {
                 .start(app.handle().clone());
             app.state::<commands::backup_manager::BackupManager>()
                 .start(app.handle().clone());
+            app.state::<commands::website::WebsiteManager>()
+                .start_autostart(app.handle().clone());
             app.state::<commands::health::HealthMonitor>()
                 .start(
                     app.state::<commands::fxserver::FxserverManager>()
@@ -295,6 +320,7 @@ fn request_app_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
 
     commands::begin_shutdown();
     app.state::<commands::live_bridge::LiveBridge>().stop();
+    app.state::<commands::website::WebsiteManager>().stop_all();
     app.state::<commands::fxserver::FxserverManager>()
         .begin_shutdown();
 

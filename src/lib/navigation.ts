@@ -5,6 +5,8 @@ import FolderKanbanIcon from "@lucide/svelte/icons/folder-kanban";
 import DatabaseIcon from "@lucide/svelte/icons/database";
 import FileJsonIcon from "@lucide/svelte/icons/file-json";
 import FolderCogIcon from "@lucide/svelte/icons/folder-cog";
+import GlobeIcon from "@lucide/svelte/icons/globe";
+import HeartIcon from "@lucide/svelte/icons/heart";
 import HashIcon from "@lucide/svelte/icons/hash";
 import HomeIcon from "@lucide/svelte/icons/home";
 import InfoIcon from "@lucide/svelte/icons/info";
@@ -33,20 +35,21 @@ export type PageId =
 	| "incidents"
 	| "onboarding"
 	| "mariadb"
-	| "sql-runner"
 	| "artifact-install"
 	| "artifact-info"
 	| "server-manage"
 	| "resource-manager"
 	| "server-configure"
 	| "server-logs"
+	| "website"
 	| "command-palette"
 	| "configurator"
 	| "profiler"
 	| "jooat"
 	| "json-formatter"
 	| "logs"
-	| "client-logs";
+	| "client-logs"
+	| "credits";
 
 export interface NavigationChild {
 	id: PageId;
@@ -82,11 +85,6 @@ export const navigation: NavigationItem[] = [
 				id: "mariadb",
 				label: "Manage MariaDB",
 				icon: DatabaseIcon,
-			},
-			{
-				id: "sql-runner",
-				label: "Queries & Files",
-				icon: TablePropertiesIcon,
 			},
 			{ id: "backup-manager", label: "Backups & Restore", icon: ArchiveIcon },
 			{ id: "database-browser", label: "Database Browser", icon: TablePropertiesIcon },
@@ -134,6 +132,7 @@ export const navigation: NavigationItem[] = [
 			{ id: "live-bridge", label: "Live Bridge", icon: PlugIcon },
 		],
 	},
+	{ id: "website", label: "Website Hosting", icon: GlobeIcon },
 	{
 		id: "log-viewers",
 		label: "Logs",
@@ -189,6 +188,7 @@ export const navigation: NavigationItem[] = [
 			},
 		],
 	},
+	{ id: "credits", label: "Credits", icon: HeartIcon },
 ];
 
 export function getPageLabel(pageId: PageId) {

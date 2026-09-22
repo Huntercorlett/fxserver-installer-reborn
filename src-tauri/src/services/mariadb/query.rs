@@ -148,11 +148,37 @@ pub fn run_admin_query(credentials: MariaDBCredentials, query: String) -> Result
     }
 }
 
+/// Fast path for loopback servers; `None` means use the client program.
+fn native_lines(credentials: &MariaDBCredentials, sql: &str) -> Option<Result<Vec<String>, String>> {
+    use crate::services::mariadb::native::{self, NativeError};
+    if !native::supported(credentials) {
+        return None;
+    }
+    match native::first_column(credentials, sql, MAX_QUERY_OUTPUT) {
+        Ok(lines) => Some(Ok(lines)),
+        Err(NativeError::Server(message)) => Some(Err(if credentials.password.is_empty() {
+            message
+        } else {
+            message.replace(&credentials.password, "[redacted]")
+        })),
+        Err(NativeError::Unavailable) => None,
+    }
+}
+
 pub fn validate_connection(credentials: MariaDBCredentials) -> Result<(), String> {
+    if let Some(result) = native_lines(&credentials, "SELECT 1;") {
+        return result.map(|_| ());
+    }
     run_admin_query(credentials, "SELECT 1;".to_string())
 }
 
 pub fn list_databases(credentials: MariaDBCredentials) -> Result<Vec<String>, String> {
+    if let Some(result) = native_lines(&credentials, "SHOW DATABASES;") {
+        return Ok(result?
+            .into_iter()
+            .filter(|database| !database.trim().is_empty())
+            .collect());
+    }
     let result = execute_query(credentials, "SHOW DATABASES;".to_string())?;
     if !result.success {
         return Err(if result.stderr.is_empty() {
@@ -175,10 +201,14 @@ pub fn list_tables(
     database: String,
 ) -> Result<Vec<String>, String> {
     let database = escape_identifier(&database)?;
-    let result = execute_query(
-        credentials,
-        format!("SHOW FULL TABLES FROM {database} WHERE Table_type = 'BASE TABLE';"),
-    )?;
+    let sql = format!("SHOW FULL TABLES FROM {database} WHERE Table_type = 'BASE TABLE';");
+    if let Some(result) = native_lines(&credentials, &sql) {
+        return Ok(result?
+            .into_iter()
+            .filter(|table| !table.trim().is_empty())
+            .collect());
+    }
+    let result = execute_query(credentials, sql)?;
     if !result.success {
         return Err(if result.stderr.is_empty() {
             "MariaDB rejected the table list query.".to_string()
@@ -269,7 +299,25 @@ pub(crate) fn validate_database_argument(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+static CLIENT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub(crate) fn clear_client_cache() {
+    *CLIENT.lock().unwrap_or_else(|error| error.into_inner()) = None;
+}
+
 pub(crate) fn find_mariadb_client() -> Option<String> {
+    let cached = CLIENT.lock().unwrap_or_else(|error| error.into_inner()).clone();
+    if let Some(client) = cached.filter(|client| {
+        !client.contains(['\\', '/']) || std::path::Path::new(client).is_file()
+    }) {
+        return Some(client);
+    }
+    let found = find_mariadb_client_uncached();
+    *CLIENT.lock().unwrap_or_else(|error| error.into_inner()) = found.clone();
+    found
+}
+
+fn find_mariadb_client_uncached() -> Option<String> {
     if let Some(install_path) = get_install_path() {
         let client_path = PathBuf::from(install_path).join("bin").join("mariadb.exe");
         if client_path.exists() {

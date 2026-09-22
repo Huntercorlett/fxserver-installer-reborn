@@ -115,6 +115,7 @@ pub struct TxDataProfilesResult {
     pub data_path: String,
     pub profiles: Vec<String>,
     pub has_root_logs: bool,
+    pub has_root_config: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,6 +1,44 @@
-use std::{path::Path, process::Command};
+use std::{
+    path::Path,
+    process::Command,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use crate::{models::mariadb::MariaDBStatus, process::CommandNoWindowExt};
+
+// Registry, service and version lookups each start PowerShell or a client process,
+// which made every database action pay seconds. The answers rarely change, so keep
+// them briefly; installers and the status refresh button clear them.
+const CACHE_TTL: Duration = Duration::from_secs(300);
+static INSTALL_PATH: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+static SERVICE: Mutex<Option<(Instant, (String, String))>> = Mutex::new(None);
+static VERSION: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+
+fn fresh<T: Clone>(slot: &Mutex<Option<(Instant, T)>>) -> Option<T> {
+    let slot = slot.lock().unwrap_or_else(|error| error.into_inner());
+    slot.as_ref()
+        .filter(|(time, _)| time.elapsed() < CACHE_TTL)
+        .map(|(_, value)| value.clone())
+}
+
+fn remember<T>(slot: &Mutex<Option<(Instant, T)>>, value: Option<T>) -> Option<T>
+where
+    T: Clone,
+{
+    if let Some(value) = &value {
+        *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some((Instant::now(), value.clone()));
+    }
+    value
+}
+
+pub fn clear_detection_cache() {
+    *INSTALL_PATH.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    *SERVICE.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    *VERSION.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    crate::services::mariadb::query::clear_client_cache();
+    crate::services::mariadb::native::reset();
+}
 
 pub fn detect_mariadb() -> MariaDBStatus {
     let service = find_service();
@@ -46,10 +84,23 @@ pub fn find_service_name() -> Option<String> {
 }
 
 pub fn get_install_path() -> Option<String> {
-    get_install_path_from_registry().or_else(get_install_path_from_service)
+    if let Some(path) = fresh(&INSTALL_PATH).filter(|path| Path::new(path).exists()) {
+        return Some(path);
+    }
+    remember(
+        &INSTALL_PATH,
+        get_install_path_from_registry().or_else(get_install_path_from_service),
+    )
 }
 
 fn find_service() -> Option<(String, String)> {
+    if let Some(service) = fresh(&SERVICE) {
+        return Some(service);
+    }
+    remember(&SERVICE, find_service_uncached())
+}
+
+fn find_service_uncached() -> Option<(String, String)> {
     let output = Command::new("powershell")
         .no_window()
         .args([
@@ -77,6 +128,13 @@ fn find_service() -> Option<(String, String)> {
 }
 
 fn get_version() -> Option<String> {
+    if let Some(version) = fresh(&VERSION) {
+        return Some(version);
+    }
+    remember(&VERSION, get_version_uncached())
+}
+
+fn get_version_uncached() -> Option<String> {
     if let Some(install_path) = get_install_path() {
         let client_path = Path::new(&install_path).join("bin").join("mariadb.exe");
         if let Some(version) = run_version_command(client_path.to_string_lossy().as_ref()) {

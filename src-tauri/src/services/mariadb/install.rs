@@ -26,7 +26,7 @@ pub fn install_mariadb(
     let log_path = installer_log_path();
     let install_plan = build_install_plan(&options)?;
     let override_args = build_msi_overrides(&options, &install_plan, &log_path)?;
-    let output = run_msi_install(&override_args, report)?;
+    let output = run_msi_install(&override_args, options.version.as_deref(), report)?;
 
     if output.success {
         let installer_message = if output.stdout.is_empty() {
@@ -74,13 +74,19 @@ pub fn install_mariadb(
     }
 }
 
+fn series_of(version: &str) -> Option<String> {
+    let parts = numeric_version_parts(version);
+    (parts.len() >= 2).then(|| format!("{}.{}", parts[0], parts[1]))
+}
+
 pub fn get_package_info() -> MariaDBPackageInfo {
-    let latest_version = super::package::latest_package()
-        .ok()
-        .map(|package| package.version);
     let installed_package_version = registry_installed_package()
         .and_then(|package| package.version)
         .or_else(|| detect_mariadb().version);
+    let installed_series = installed_package_version.as_deref().and_then(series_of);
+    let latest_version = super::package::resolve_package(installed_series.as_deref())
+        .ok()
+        .map(|package| package.version);
     let update_available = match (&installed_package_version, &latest_version) {
         (Some(installed), Some(latest)) => compare_versions(installed, latest).is_lt(),
         _ => false,
@@ -145,9 +151,10 @@ pub fn uninstall_mariadb(report: &dyn Fn(&str)) -> Result<String, String> {
 
 pub fn update_mariadb(report: &dyn Fn(&str)) -> Result<String, String> {
     let before = get_package_info().installed_package_version;
+    let series = before.as_deref().and_then(series_of);
     let log_path = installer_log_path();
     let override_args = build_update_overrides(&log_path);
-    let output = run_msi_install(&override_args, report)?;
+    let output = run_msi_install(&override_args, series.as_deref(), report)?;
 
     if !output.success {
         let detail = if output.stderr.is_empty() {
@@ -190,9 +197,13 @@ pub(super) struct InstallOutput {
     pub stderr: String,
 }
 
-fn run_msi_install(override_args: &str, report: &dyn Fn(&str)) -> Result<InstallOutput, String> {
-    report("Resolving the latest stable MariaDB Windows installer.");
-    let package = super::package::latest_package()?;
+fn run_msi_install(
+    override_args: &str,
+    requested_version: Option<&str>,
+    report: &dyn Fn(&str),
+) -> Result<InstallOutput, String> {
+    report("Resolving the selected MariaDB Windows installer.");
+    let package = super::package::resolve_package(requested_version)?;
     let path = installer_log_path().with_extension("msi");
     let result = (|| {
         report(&format!(
@@ -330,7 +341,7 @@ exit 0
     run_elevated_powershell_script("mariadb-uninstall", &script, timeout)
 }
 
-fn run_elevated_powershell_script(
+pub(super) fn run_elevated_powershell_script(
     script_name: &str,
     script: &str,
     timeout: Duration,
@@ -1802,6 +1813,7 @@ mod tests {
 
     fn options() -> MariaDBInstallOptions {
         MariaDBInstallOptions {
+            version: None,
             root_password: "secret".to_string(),
             service_name: "MariaDB".to_string(),
             port: 3306,
@@ -1840,6 +1852,13 @@ mod tests {
         assert!(!overrides.contains("ALLOWREMOTEROOTACCESS"));
         assert!(!overrides.contains("DEFAULTUSER"));
         assert!(!overrides.contains("REMOVE="));
+    }
+
+    #[test]
+    fn series_is_taken_from_installed_versions() {
+        assert_eq!(series_of("10.11.14.0").as_deref(), Some("10.11"));
+        assert_eq!(series_of("mariadb  Ver 15.1 Distrib 12.1.2-MariaDB").as_deref(), Some("12.1"));
+        assert_eq!(series_of("12"), None);
     }
 
     #[test]

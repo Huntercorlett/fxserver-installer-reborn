@@ -17,6 +17,7 @@
 	import { log } from "$lib/core/logger.svelte";
 	import { taskSession } from "$lib/core/tasks.svelte";
 	import ArtifactBrowser from "./ArtifactBrowser.svelte";
+	import EnhancedInstallCard from "./EnhancedInstallCard.svelte";
 	import {
 		artifactIsFlagged,
 		fetchArtifactMetadata,
@@ -43,6 +44,7 @@
 
 	const recommendedIsFlagged = $derived(metadata ? artifactIsFlagged(metadata.recommendedArtifact, metadata.brokenArtifacts) : false);
 	const health = $derived<ArtifactHealthStatus>(getArtifactHealthStatus(metadata, installed));
+	const isEnhanced = $derived(installed?.edition === "enhanced");
 
 	onMount(() => {
 		loadInstallPath();
@@ -155,6 +157,15 @@
 		<Notice tone="success" message={message} onDismiss={() => (message = "")} class="px-4 py-3 text-sm" />
 	{/if}
 
+	{#if isEnhanced}
+		<Notice
+			tone="warn"
+			title="FiveM for GTAV Enhanced server detected"
+			message="This folder contains cfx-server.exe. Legacy installs are blocked here so two server builds are never mixed. Use the Enhanced installer below to update it, or pick a different folder."
+			class="px-4 py-3 text-sm"
+		/>
+	{/if}
+
 	<div class="grid gap-4 xl:grid-cols-12">
 		<Card.Root class="group relative overflow-hidden rounded-sm border-border bg-card shadow-sm transition-shadow duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] xl:col-span-7">
 			<div
@@ -211,7 +222,7 @@
 					</div>
 				{/if}
 
-				<Button class="w-full rounded-sm" onclick={install} disabled={installing || busy || !metadata || !installPath.trim()} title="Download and extract the recommended Windows artifact">
+				<Button class="w-full rounded-sm" onclick={install} disabled={installing || busy || isEnhanced || !metadata || !installPath.trim()} title="Download and extract the recommended Windows artifact">
 					{#if installing}
 						<LoaderCircleIcon class="animate-spin" />
 						Installing...
@@ -264,5 +275,14 @@
 			</Card.Root>
 		</div>
 	</div>
-	<ArtifactBrowser destination={installPath} currentVersion={installed?.version} disabled={installing || busy} oninstall={installSelected} />
+	<EnhancedInstallCard
+		destination={installPath}
+		blocked={installed?.edition === "legacy"}
+		oninstalled={async (next) => {
+			result = next;
+			installed = await getInstalledWindowsArtifactInfo(installPath.trim());
+			message = `Installed Enhanced build ${next.version}.`;
+		}}
+	/>
+	<ArtifactBrowser destination={installPath} currentVersion={installed?.version} disabled={installing || busy || isEnhanced} oninstall={installSelected} />
 </section>

@@ -226,6 +226,9 @@
 		setTxDataPath(selectedFolder);
 		setServerProfile("");
 		await refreshTxDataProfiles();
+		if (!active) return;
+		dataPath = fxserverSettings.txDataPath;
+		profile = fxserverSettings.profile;
 	}
 
 	async function handleTxDataChange(event: Event) {
@@ -238,6 +241,9 @@
 		setTxDataPath(dataPath);
 		setServerProfile("");
 		await refreshTxDataProfiles();
+		if (!active) return;
+		dataPath = fxserverSettings.txDataPath;
+		profile = fxserverSettings.profile;
 	}
 
 	function handleProfileChange(nextProfile: string) {

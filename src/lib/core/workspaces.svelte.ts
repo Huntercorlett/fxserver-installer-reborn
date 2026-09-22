@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { databaseSession, rememberDatabaseCredentials } from "./databaseSession.svelte";
+import { untrack } from "svelte";
+import { databaseSession, rememberDatabaseCredentials, restoreSavedLogin } from "./databaseSession.svelte";
 import type { MariaDBCredentials } from "$lib/modules/mariadb";
 import { getInstallPath, setInstallPath } from "./paths.svelte";
 import { hasRunningTasks, taskSession, trackTask } from "./tasks.svelte";
@@ -30,6 +31,7 @@ export function initializeWorkspaces() {
 	} else {
 		workspaceSession.items = [emptyWorkspace("default", "Default")];
 		captureActiveWorkspace();
+		persist();
 	}
 	taskSession.workspaceId = workspaceSession.activeId;
 	if ("__TAURI_INTERNALS__" in window) {
@@ -45,15 +47,28 @@ function persist() {
 
 export function captureActiveWorkspace() {
 	if (!loaded || applying) return;
-	const current = workspaceSession.items.find((item) => item.id === workspaceSession.activeId);
-	if (!current) return;
-	current.artifactPath = getInstallPath();
-	current.txDataPath = fxserverSettings.txDataPath;
-	current.profile = fxserverSettings.profile;
-	current.environment = publicEnvironment(readSavedEnvironment());
-	const { host, port, username, database } = databaseSession.defaults;
-	current.database = { host, port, username, database };
-	persist();
+	// Untracked + change-only: this runs synchronously from "workspace-settings-changed", which pages
+	// dispatch from inside $effect blocks. Tracking or re-assigning identical values here re-triggers
+	// those effects forever and freezes the UI.
+	untrack(() => {
+		const current = workspaceSession.items.find((item) => item.id === workspaceSession.activeId);
+		if (!current) return;
+		const { host, port, username, database } = databaseSession.defaults;
+		const next = {
+			artifactPath: getInstallPath(),
+			txDataPath: fxserverSettings.txDataPath,
+			profile: fxserverSettings.profile,
+			environment: publicEnvironment(readSavedEnvironment()),
+			database: { host, port, username, database },
+		};
+		let changed = false;
+		for (const key of Object.keys(next) as (keyof typeof next)[]) {
+			if (JSON.stringify(current[key]) === JSON.stringify(next[key])) continue;
+			(current[key] as unknown) = next[key];
+			changed = true;
+		}
+		if (changed) persist();
+	});
 }
 
 function applySettings(workspace: Workspace) {
@@ -68,8 +83,11 @@ function applySettings(workspace: Workspace) {
 		databaseSession.revision += 1;
 		databaseSession.credentials = null;
 		databaseSession.connectionString = "";
+		databaseSession.workspaceId = workspace.id;
+		databaseSession.remember = false;
 		const credentials = databaseCredentials.get(workspace.id);
 		if (credentials) rememberDatabaseCredentials(credentials);
+		void restoreSavedLogin(workspace.id, databaseSession.revision);
 	} finally {
 		applying = false;
 	}
@@ -115,6 +133,7 @@ export async function removeWorkspace(id: string) {
 				await invoke("remove_backup_schedule", { workspaceId: id, scheduleId: schedule.config.id });
 			}
 			await invoke("clear_fxserver_rcon_password", { workspaceId: id });
+			await invoke("clear_mariadb_login", { workspaceId: id });
 		}
 		workspaceSession.items = workspaceSession.items.filter((item) => item.id !== id);
 		databaseCredentials.delete(id);

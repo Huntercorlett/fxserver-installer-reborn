@@ -59,6 +59,26 @@ export function installArtifactBuild(build: ArtifactBuild, destination: string, 
 	});
 }
 
+export interface EnhancedArtifactBuild {
+	version: string;
+	downloadUrl: string;
+}
+
+export interface EnhancedArtifactCatalog {
+	builds: EnhancedArtifactBuild[];
+	sourceUrl: string;
+	warning: string | null;
+}
+
+export function fetchEnhancedCatalog() {
+	if (!hasTauriRuntime()) throw new Error("The Enhanced server installer is available in the desktop app.");
+	return invoke<EnhancedArtifactCatalog>("get_enhanced_artifact_catalog");
+}
+
+export function installEnhancedArtifact(url: string, destination: string) {
+	return invoke<ArtifactInstallResult>("install_enhanced_artifact", { request: { url, destination } });
+}
+
 export interface InstalledArtifactInfo {
 	installed: boolean;
 	version?: string | null;
@@ -68,6 +88,8 @@ export interface InstalledArtifactInfo {
 	fileVersion?: string | null;
 	productVersion?: string | null;
 	hasFxserverExecutable: boolean;
+	/** "enhanced" when cfx-server.exe (FiveM for GTAV Enhanced) is present, "legacy" for FXServer.exe. */
+	edition?: "legacy" | "enhanced" | null;
 	detectionSource: "marker" | "executable" | "none" | string;
 }
 
@@ -188,7 +210,19 @@ function artifactNumber(version?: string | null) {
 	return Number.isFinite(parsed) ? parsed : null;
 }
 
+export const enhancedDownloadUrl = "https://docs.fivem.net/docs/server-download/?platform=enhanced&os=windows";
+
 export function getArtifactHealthStatus(metadata: ArtifactMetadata | null, installed: InstalledArtifactInfo | null): ArtifactHealthStatus {
+	if (installed?.edition === "enhanced") {
+		return {
+			urgency: "unknown",
+			label: "FiveM for GTAV Enhanced",
+			description: "Enhanced builds are versioned separately from Legacy, so the Legacy recommendation and issue list do not apply. Update it from the Enhanced tab on the Cfx.re Server Download page.",
+			currentVersion: installed.version,
+			recommendedVersion: null,
+		};
+	}
+
 	if (!metadata) {
 		return {
 			urgency: "unknown",

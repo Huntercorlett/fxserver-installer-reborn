@@ -5,7 +5,8 @@
 	import { Button } from "$lib/components/ui/button/index.js";
 	import { Input } from "$lib/components/ui/input/index.js";
 	import PasswordInput from "$lib/components/ui/password-input.svelte";
-	import type { MariaDBInstallOptions, MariaDBPackageInfo } from "$lib/modules/mariadb";
+	import { onMount } from "svelte";
+	import { listMariaDBReleases, listMariaDBVersions, type MariaDBInstallOptions, type MariaDBPackageInfo, type MariaDBRelease, type MariaDBSeries } from "$lib/modules/mariadb";
 
 	type Props = {
 		busy: boolean;
@@ -16,6 +17,60 @@
 	};
 
 	let { busy, packageInfo, installStage, installOptions = $bindable(), onInstall }: Props = $props();
+
+	const selectClass = "h-9 rounded-sm border border-input bg-background px-2.5 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50";
+
+	const presets = {
+		fivem: { label: "FiveM server (recommended)", values: { optimizeForTransactions: true, useUtf8: true, allowRemoteRootAccess: false, createAnonymousUser: false, skipNetworking: false, installHeidiSql: false, installDevelopmentFiles: false } },
+		heidi: { label: "FiveM server + HeidiSQL", values: { optimizeForTransactions: true, useUtf8: true, allowRemoteRootAccess: false, createAnonymousUser: false, skipNetworking: false, installHeidiSql: true, installDevelopmentFiles: false } },
+		developer: { label: "Developer (HeidiSQL + dev files)", values: { optimizeForTransactions: true, useUtf8: true, allowRemoteRootAccess: false, createAnonymousUser: false, skipNetworking: false, installHeidiSql: true, installDevelopmentFiles: true } },
+		minimal: { label: "Minimal (server only, no tuning)", values: { optimizeForTransactions: false, useUtf8: true, allowRemoteRootAccess: false, createAnonymousUser: false, skipNetworking: false, installHeidiSql: false, installDevelopmentFiles: false } },
+	} as const;
+
+	let series = $state<MariaDBSeries[]>([]);
+	let releases = $state<MariaDBRelease[]>([]);
+	let selectedSeries = $state("");
+	let selectedRelease = $state("");
+	let versionError = $state("");
+	let loadingVersions = $state(false);
+
+	onMount(async () => {
+		loadingVersions = true;
+		try {
+			series = await listMariaDBVersions();
+		} catch (error) {
+			versionError = error instanceof Error ? error.message : String(error);
+		} finally {
+			loadingVersions = false;
+		}
+	});
+
+	function applyPreset(event: Event) {
+		const preset = presets[(event.currentTarget as HTMLSelectElement).value as keyof typeof presets];
+		if (preset) Object.assign(installOptions, preset.values);
+	}
+
+	async function chooseSeries(event: Event) {
+		selectedSeries = (event.currentTarget as HTMLSelectElement).value;
+		selectedRelease = "";
+		releases = [];
+		installOptions.version = selectedSeries;
+		if (!selectedSeries) return;
+		loadingVersions = true;
+		versionError = "";
+		try {
+			releases = await listMariaDBReleases(selectedSeries);
+		} catch (error) {
+			versionError = error instanceof Error ? error.message : String(error);
+		} finally {
+			loadingVersions = false;
+		}
+	}
+
+	function chooseRelease(event: Event) {
+		selectedRelease = (event.currentTarget as HTMLSelectElement).value;
+		installOptions.version = selectedRelease || selectedSeries;
+	}
 
 	const boolOptions = [
 		["allowRemoteRootAccess", "Remote root", "Allow the MariaDB root account to connect from remote hosts."],
@@ -38,7 +93,7 @@
 				<div class="min-w-0">
 					<Card.Title>Install Configuration</Card.Title>
 					<Card.Description>
-						{packageInfo?.latestVersion ? `MariaDB ${packageInfo.latestVersion}` : "Latest stable MariaDB"} - official Windows MSI.
+						{installOptions.version ? `MariaDB ${installOptions.version}` : packageInfo?.latestVersion ? `MariaDB ${packageInfo.latestVersion}` : "Default MariaDB 10.11 LTS"} - official Windows MSI.
 					</Card.Description>
 				</div>
 			</div>
@@ -68,6 +123,33 @@
 		{/if}
 
 		<div class="grid gap-3 md:grid-cols-3">
+			<label class="grid gap-1.5">
+				<span class="text-xs font-medium text-muted-foreground">Preset</span>
+				<select onchange={applyPreset} title="Fill the options below with a ready-made combination." class={selectClass}>
+					<option value="">Custom</option>
+					{#each Object.entries(presets) as [key, preset]}
+						<option value={key}>{preset.label}</option>
+					{/each}
+				</select>
+			</label>
+			<label class="grid gap-1.5">
+				<span class="text-xs font-medium text-muted-foreground">MariaDB Series</span>
+				<select value={selectedSeries} onchange={chooseSeries} disabled={loadingVersions && !series.length} title="Choose which MariaDB release series to install." class={selectClass}>
+					<option value="">Default (10.11 LTS)</option>
+					{#each series as item}
+						<option value={item.series}>{item.series}{item.support ? ` - ${item.support}` : item.status ? ` - ${item.status}` : ""}</option>
+					{/each}
+				</select>
+			</label>
+			<label class="grid gap-1.5">
+				<span class="text-xs font-medium text-muted-foreground">Exact Version</span>
+				<select value={selectedRelease} onchange={chooseRelease} disabled={!selectedSeries || loadingVersions} title="Pin a specific patch release, or install the newest in the series." class={selectClass}>
+					<option value="">{selectedSeries ? "Latest in series" : "Select a series first"}</option>
+					{#each releases as release}
+						<option value={release.version}>{release.version}{release.date ? ` (${release.date})` : ""}</option>
+					{/each}
+				</select>
+			</label>
 			<label class="grid gap-1.5">
 				<span class="text-xs font-medium text-muted-foreground">Root Password</span>
 				<PasswordInput bind:value={installOptions.rootPassword} placeholder="Required root password" title="Root password used by the MariaDB installer." />
@@ -122,6 +204,10 @@
 				</label>
 			{/each}
 		</div>
+
+		{#if versionError}
+			<p class="rounded-sm border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-100">Could not load the MariaDB version list ({versionError}). The default 10.11 LTS will be used unless a version is selected.</p>
+		{/if}
 
 		{#if installOptions.skipNetworking}
 			<p class="rounded-sm border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-100">

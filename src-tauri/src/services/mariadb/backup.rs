@@ -31,11 +31,13 @@ pub fn create_backup(
     let mut command = Command::new(dump_client);
     command.no_window();
     let _credentials_file = apply_credentials_args(&mut command, &credentials)?;
+    // mariadb-dump/mysqldump does not recognise --connect-timeout (that's a
+    // mysql/mariadb client option, not a dump-tool one) — passing it fails
+    // with "unknown variable 'connect-timeout=10'" before the dump even starts.
     command
         .arg("--result-file")
         .arg(&output_path)
         .arg("--hex-blob")
-        .arg("--connect-timeout=10")
         .arg("--default-character-set=utf8mb4");
 
     if options.single_transaction {

@@ -21,12 +21,14 @@
 	import { openExternalUrl } from "$lib/core/openExternal";
 	import { chooseFolder } from "$lib/core/selectFolder";
 	import {
-		backendCommandExample,
+		nodeCommandExample,
+		detectWebsiteSetup,
 		emptyWebsiteSite,
 		firewallCommand,
 		formatBytes,
 		getWebsiteRequests,
 		getWebsiteSites,
+		installBundledPhp,
 		listWebsitePages,
 		removeWebsiteSite,
 		saveWebsiteSite,
@@ -34,7 +36,6 @@
 		stopWebsiteSite,
 		validateWebsiteSite,
 		type WebsiteRequestEntry,
-		type WebsiteRuntime,
 		type WebsiteSiteConfig,
 		type WebsiteSiteStatus,
 	} from "$lib/modules/website";
@@ -124,6 +125,11 @@
 	}
 
 	let pages = $state<string[]>([]);
+	let autoNote = $state("");
+	let runtimeOverride = $state(false);
+	let phpInstalling = $state(false);
+	let phpInstallStage = $state("");
+	let phpInstallError = $state("");
 
 	async function loadPages() {
 		const root = form?.root.trim();
@@ -134,11 +140,58 @@
 		}
 	}
 
+	/** XAMPP-style: point at a folder and it works out PHP/Node/static itself. */
+	async function detectRuntime() {
+		const root = form?.root.trim();
+		if (!root) {
+			autoNote = "";
+			return;
+		}
+		try {
+			const detected = await detectWebsiteSetup(root);
+			if (!form) return;
+			form.runtime = detected.runtime;
+			if (detected.runtime === "php" && detected.phpCgiPath) {
+				form.backendCommand = detected.phpCgiPath;
+			}
+			if (detected.runtime === "node" && detected.nodeCommand) {
+				form.backendCommand = detected.nodeCommand;
+				if (!form.backendPort) form.backendPort = 3000;
+			}
+			autoNote = detected.message;
+		} catch {
+			autoNote = "";
+		}
+	}
+
+	async function onRootChanged() {
+		await loadPages();
+		await detectRuntime();
+	}
+
+	/** No XAMPP, no manual download: one button fetches a portable PHP. */
+	async function installPhpNow() {
+		phpInstalling = true;
+		phpInstallError = "";
+		phpInstallStage = "Starting...";
+		try {
+			await installBundledPhp((stage) => (phpInstallStage = stage));
+			await detectRuntime();
+		} catch (error) {
+			phpInstallError = error instanceof Error ? error.message : String(error);
+		} finally {
+			phpInstalling = false;
+		}
+	}
+
 	function openForm(site?: WebsiteSiteConfig) {
 		form = site ? { ...site } : { ...emptyWebsiteSite(), port: nextFreePort() };
 		formError = "";
 		message = "";
+		autoNote = "";
+		runtimeOverride = false;
 		void loadPages();
+		if (form.root.trim()) void detectRuntime();
 	}
 
 	function nextFreePort() {
@@ -154,7 +207,7 @@
 			const selected = await chooseFolder(form.root);
 			if (selected && form) {
 				form.root = selected;
-				void loadPages();
+				void onRootChanged();
 				if (!form.name.trim()) form.name = selected.split(/[\\/]/).filter(Boolean).pop() ?? "";
 			}
 		} catch (caught) {
@@ -255,8 +308,8 @@
 
 	<Notice
 		tone="info"
-		title="Static, PHP, or Node"
-		message="Static serves files exactly as they are (HTML, CSS, JavaScript, images, fonts, video). PHP and Node hand every request straight to your own command (php or node) and pass the response straight back, so nothing here caches it. Sites only stay online while FXServer Installer is open, and it keeps running in the tray when you close the window."
+		title="Works like XAMPP's htdocs"
+		message="Choose a folder and it just runs: .php files are detected and run through php-cgi automatically if PHP is installed, a Node app's package.json/server.js is detected and reverse-proxied, and anything else is served as static files. You can still set it manually if you need to. Sites only stay online while FXServer Installer is open, and it keeps running in the tray when you close the window."
 		class="px-4 py-3 text-sm"
 	/>
 
@@ -283,7 +336,7 @@
 				<div class="grid gap-2">
 					<span class="text-xs font-medium text-muted-foreground">Website folder</span>
 					<div class="flex gap-2">
-						<Input bind:value={form.root} disabled={formBusy} onchange={loadPages} placeholder="C:\websites\my-site" class="min-w-0 flex-1" />
+						<Input bind:value={form.root} disabled={formBusy} onchange={onRootChanged} placeholder="C:\websites\my-site" class="min-w-0 flex-1" />
 						<Button variant="outline" onclick={browse} disabled={formBusy} title="Choose the website folder">
 							<FolderOpenIcon />
 							Browse
@@ -321,17 +374,48 @@
 
 				<div class="grid gap-2">
 					<span class="text-xs font-medium text-muted-foreground">What handles requests</span>
-					<div class="flex flex-wrap gap-2">
-						<Button variant={form.runtime === "static" ? "default" : "outline"} onclick={() => form && (form.runtime = "static")} disabled={formBusy}>Static files</Button>
-						<Button variant={form.runtime === "php" ? "default" : "outline"} onclick={() => form && (form.runtime = "php")} disabled={formBusy}>PHP</Button>
-						<Button variant={form.runtime === "node" ? "default" : "outline"} onclick={() => form && (form.runtime = "node")} disabled={formBusy}>Node</Button>
-					</div>
-					{#if form.runtime !== "static"}
-						{@const runtime = form.runtime as WebsiteRuntime}
+					{#if !runtimeOverride}
+						<div class="flex flex-wrap items-center gap-2 rounded-sm border border-border bg-muted/40 px-3 py-2 text-sm">
+							<span class="font-medium text-foreground">
+								{#if form.runtime === "php"}PHP{:else if form.runtime === "node"}Node{:else}Static files{/if}
+							</span>
+							<span class="text-xs text-muted-foreground">{autoNote || "Detected automatically from the folder above, XAMPP-style — choose the folder first."}</span>
+							<Button variant="ghost" class="ml-auto h-auto p-0 text-xs underline" onclick={() => (runtimeOverride = true)} disabled={formBusy}>Set manually</Button>
+						</div>
+						{#if form.runtime === "php" && !form.backendCommand}
+							<div class="flex flex-col gap-2 rounded-sm border border-dashed border-border px-3 py-2">
+								<p class="text-xs leading-5 text-muted-foreground">PHP isn't set up on this PC yet — no XAMPP needed, this app can fetch its own portable copy (~30 MB) and keep it next to itself.</p>
+								{#if phpInstalling}
+									<p class="text-xs text-muted-foreground">{phpInstallStage}</p>
+								{:else}
+									<Button size="sm" onclick={installPhpNow} disabled={formBusy}>Install PHP automatically</Button>
+								{/if}
+								{#if phpInstallError}
+									<p class="text-xs leading-5 text-destructive">{phpInstallError}</p>
+								{/if}
+							</div>
+						{/if}
+					{:else}
+						<div class="flex flex-wrap gap-2">
+							<Button variant={form.runtime === "static" ? "default" : "outline"} onclick={() => form && (form.runtime = "static")} disabled={formBusy}>Static files</Button>
+							<Button variant={form.runtime === "php" ? "default" : "outline"} onclick={() => form && (form.runtime = "php")} disabled={formBusy}>PHP</Button>
+							<Button variant={form.runtime === "node" ? "default" : "outline"} onclick={() => form && (form.runtime = "node")} disabled={formBusy}>Node</Button>
+							<Button variant="ghost" class="text-xs underline" onclick={() => (runtimeOverride = false)} disabled={formBusy}>Back to auto-detect</Button>
+						</div>
+					{/if}
+					{#if form.runtime === "php" && runtimeOverride}
+						<label class="grid gap-2 pt-2">
+							<span class="text-xs font-medium text-muted-foreground">php-cgi.exe path</span>
+							<Input bind:value={form.backendCommand} disabled={formBusy} placeholder="C:\php\php-cgi.exe" class="font-mono" />
+						</label>
+						<p class="text-xs leading-5 text-muted-foreground">
+							.php files in the folder above run through this and everything else in that folder is still served as-is, the same as XAMPP's htdocs. Needs php-cgi.exe specifically, not php.exe — it ships alongside php.exe in a normal PHP for Windows build. Nothing here caches the output; every request runs the script fresh.
+						</p>
+					{:else if form.runtime === "node"}
 						<div class="grid gap-4 pt-2 sm:grid-cols-[1fr_10rem]">
 							<label class="grid gap-2">
 								<span class="text-xs font-medium text-muted-foreground">Backend command</span>
-								<Input bind:value={form.backendCommand} disabled={formBusy} placeholder={backendCommandExample(runtime)} class="font-mono" />
+								<Input bind:value={form.backendCommand} disabled={formBusy} placeholder={nodeCommandExample} class="font-mono" />
 							</label>
 							<label class="grid gap-2">
 								<span class="text-xs font-medium text-muted-foreground">Backend port</span>
@@ -339,7 +423,7 @@
 							</label>
 						</div>
 						<p class="text-xs leading-5 text-muted-foreground">
-							Run from the website folder above. It has to listen on 127.0.0.1 at the backend port — for example <code class="rounded-xs bg-muted px-1 py-0.5">{backendCommandExample(runtime)}</code>. Every request on port {form.port || "the website port"} above is handed straight to it and the response is sent back untouched, so caching is entirely up to the app itself.
+							Run from the website folder above. It has to listen on 127.0.0.1 at the backend port — for example <code class="rounded-xs bg-muted px-1 py-0.5">{nodeCommandExample}</code>. Every request on port {form.port || "the website port"} above is handed straight to it and the response is sent back untouched, so caching is entirely up to the app itself.
 						</p>
 					{/if}
 				</div>
@@ -477,6 +561,7 @@
 						{#if site.running}
 							<span>Running since {timeFormatter.format(new Date(site.startedAt ?? Date.now()))}</span>
 						{/if}
+						{#if site.config.runtime === "php"}<span>PHP</span>{:else if site.config.runtime === "node"}<span>Node</span>{/if}
 						{#if site.config.spaFallback}<span>Single-page app mode</span>{/if}
 						{#if site.config.autostart}<span>Starts with the app</span>{/if}
 					</div>

@@ -1,9 +1,12 @@
-//! Small static-file HTTP server behind the "Website Hosting" page.
+//! HTTP server behind the "Website Hosting" page.
 //!
-//! Each configured site is one folder served on one port. The server is
-//! intentionally minimal (GET/HEAD/OPTIONS, keep-alive, ETag, byte ranges) and
-//! deliberately safe by default: dotfiles, server-side scripts and config-like
-//! files are never served, and requests can never leave the site folder.
+//! Each configured site is one folder served on one port. Static sites are
+//! served as-is (GET/HEAD/OPTIONS, keep-alive, ETag, byte ranges) and are
+//! deliberately safe by default: dotfiles, server-side scripts and
+//! config-like files are never served, and requests can never leave the
+//! site folder. A PHP site runs `.php` files through php-cgi in that same
+//! folder, XAMPP-style — everything else in it is still a plain static file.
+//! A Node site instead runs the user's own server and is reverse-proxied to.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -74,9 +77,9 @@ pub enum Runtime {
     /// Files are served exactly as they are.
     #[default]
     Static,
-    /// A PHP app started by the configured backend command handles every request.
+    /// A PHP process (e.g. `php -S 127.0.0.1:PORT -t .`) handles every request.
     Php,
-    /// A Node app started by the configured backend command handles every request.
+    /// A Node process (e.g. `node server.js`) handles every request.
     Node,
 }
 
@@ -218,13 +221,34 @@ pub fn normalize_config(
             config.backend_command.clear();
             config.backend_port = 0;
         }
-        Runtime::Php | Runtime::Node => {
+        Runtime::Php => {
+            config.backend_command = config.backend_command.trim().trim_matches('"').to_string();
+            if config.backend_command.is_empty() {
+                // XAMPP never makes you type this in — try to find it first.
+                match find_php_cgi() {
+                    Some(cgi) => config.backend_command = cgi.to_string_lossy().to_string(),
+                    None => {
+                        return Err(
+                            "PHP isn't installed yet. Use the \"Install PHP\" button on this page (downloads a portable copy automatically), or enter the path to php-cgi.exe yourself.".into(),
+                        )
+                    }
+                }
+            }
+            if !Path::new(&config.backend_command).is_file() {
+                return Err(format!(
+                    "php-cgi.exe was not found at: {}",
+                    config.backend_command
+                ));
+            }
+            config.backend_port = 0;
+        }
+        Runtime::Node => {
             config.backend_command = config.backend_command.trim().to_string();
             if config.backend_command.is_empty() {
-                return Err("Enter the command that starts the PHP or Node app.".into());
+                return Err("Enter the command that starts the Node app.".into());
             }
             if config.backend_port == 0 {
-                return Err("Enter the port the PHP or Node app listens on.".into());
+                return Err("Enter the port the Node app listens on.".into());
             }
             if config.backend_port == config.port {
                 return Err(
@@ -343,6 +367,177 @@ pub fn list_html_pages(root: &str) -> Vec<String> {
     let mut pages = Vec::new();
     walk(Path::new(root), "", 0, &mut pages);
     pages
+}
+
+/// What `detect_site_setup` found in a website folder: XAMPP-style — point it
+/// at a folder and it works out whether that's a plain static site, a PHP
+/// site, or a Node app, the same way XAMPP's htdocs just runs whatever you
+/// drop into it without asking.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedSiteSetup {
+    pub runtime: Runtime,
+    /// Populated when `runtime` is Php and a php-cgi.exe was found on this
+    /// machine, so the user never has to type a path themselves.
+    pub php_cgi_path: Option<String>,
+    /// Populated when `runtime` is Node and a package.json start script or a
+    /// server.js/index.js/app.js was found, as a ready-to-use command.
+    pub node_command: Option<String>,
+    /// One line explaining what was detected and why, shown under the field.
+    pub message: String,
+}
+
+/// Looks for `.php` files (a couple of levels deep, skipping `node_modules`
+/// and dotfolders) so a folder full of PHP doesn't need to be told it's PHP.
+fn folder_has_php(root: &Path) -> bool {
+    fn walk(dir: &Path, depth: usize) -> bool {
+        if depth > 3 {
+            return false;
+        }
+        let Ok(entries) = fs::read_dir(dir) else { return false };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_file() {
+                if name.to_ascii_lowercase().ends_with(".php") {
+                    return true;
+                }
+            } else if kind.is_dir() && name != "node_modules" && walk(&entry.path(), depth + 1) {
+                return true;
+            }
+        }
+        false
+    }
+    walk(root, 0)
+}
+
+/// A Node app declares itself with a package.json (npm start / main entry) or
+/// a conventional entry file sitting right in the folder.
+fn detect_node_command(root: &Path) -> Option<String> {
+    let package_json = root.join("package.json");
+    if let Ok(raw) = fs::read_to_string(&package_json) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let has_start_script = value
+                .get("scripts")
+                .and_then(|scripts| scripts.get("start"))
+                .is_some();
+            if has_start_script {
+                return Some("npm start".to_string());
+            }
+            if let Some(main) = value.get("main").and_then(|main| main.as_str()) {
+                if root.join(main).is_file() {
+                    return Some(format!("node {main}"));
+                }
+            }
+        }
+    }
+    for candidate in ["server.js", "index.js", "app.js"] {
+        if root.join(candidate).is_file() {
+            return Some(format!("node {candidate}"));
+        }
+    }
+    None
+}
+
+/// Common places a Windows PHP install leaves php-cgi.exe, checked in the
+/// order XAMPP users are most likely to have it: an existing XAMPP/WAMP
+/// install, a manual PHP install, then whatever `php-cgi` resolves to on PATH.
+pub fn find_php_cgi() -> Option<PathBuf> {
+    // Prefer the portable PHP this app downloaded for itself — it's always
+    // there once installed, doesn't depend on XAMPP or any system install,
+    // and won't disappear if the user uninstalls something else.
+    if let Some(bundled) = super::php::bundled_php_cgi_path() {
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+    let fixed_candidates = [
+        r"C:\xampp\php\php-cgi.exe",
+        r"C:\wamp64\bin\php",
+        r"C:\wamp\bin\php",
+        r"C:\php\php-cgi.exe",
+        r"C:\tools\php\php-cgi.exe",
+        r"C:\Program Files\PHP\php-cgi.exe",
+        r"C:\Program Files (x86)\PHP\php-cgi.exe",
+    ];
+    for candidate in fixed_candidates {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+        // wamp installs php inside a versioned subfolder, e.g. bin\php\php8.3.1\
+        if path.is_dir() {
+            if let Ok(entries) = fs::read_dir(&path) {
+                let mut versions: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                versions.sort();
+                for version_dir in versions.into_iter().rev() {
+                    let exe = version_dir.join("php-cgi.exe");
+                    if exe.is_file() {
+                        return Some(exe);
+                    }
+                }
+            }
+        }
+    }
+    // Fall back to whatever the system PATH resolves php-cgi.exe to, the way
+    // XAMPP's own shortcuts do.
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let exe = dir.join("php-cgi.exe");
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+/// XAMPP-style auto-detection: look at what's actually in the folder and
+/// work out how to serve it, instead of asking the user to choose a runtime
+/// and hunt down php-cgi.exe themselves.
+pub fn detect_site_setup(root: &str) -> DetectedSiteSetup {
+    let root_path = Path::new(root.trim().trim_matches('"'));
+    if !root_path.is_dir() {
+        return DetectedSiteSetup::default();
+    }
+    if let Some(node_command) = detect_node_command(root_path) {
+        return DetectedSiteSetup {
+            runtime: Runtime::Node,
+            node_command: Some(node_command),
+            message: "Found a package.json / server entry point — treating this as a Node app."
+                .to_string(),
+            ..Default::default()
+        };
+    }
+    if folder_has_php(root_path) {
+        return match find_php_cgi() {
+            Some(cgi) => DetectedSiteSetup {
+                runtime: Runtime::Php,
+                php_cgi_path: Some(cgi.to_string_lossy().to_string()),
+                message: "Found .php files and a PHP install on this PC — .php pages will run automatically, just like XAMPP's htdocs.".to_string(),
+                ..Default::default()
+            },
+            None => DetectedSiteSetup {
+                runtime: Runtime::Php,
+                php_cgi_path: None,
+                message: "Found .php files but PHP isn't set up yet on this PC.".to_string(),
+                ..Default::default()
+            },
+        };
+    }
+    DetectedSiteSetup {
+        runtime: Runtime::Static,
+        message: "No .php or Node app found — serving the folder as plain static files."
+            .to_string(),
+        ..Default::default()
+    }
 }
 
 /// Best-effort LAN address, used only to show a shareable URL.
@@ -491,9 +686,13 @@ struct SiteContext {
     index_file: String,
     spa_fallback: bool,
     stats: Arc<SiteStats>,
-    /// Set when the site's requests are forwarded to a PHP/Node process
-    /// instead of being served as static files.
+    /// Set when the site's requests are forwarded to a Node process instead
+    /// of being served as static files.
     backend: Option<SocketAddr>,
+    /// Set when this site runs PHP: the path to php-cgi.exe. `.php` files
+    /// resolved by `route_php` are executed through it; everything else in
+    /// the folder is still served as a plain static file, same as XAMPP.
+    php_cgi: Option<PathBuf>,
 }
 
 impl SiteContext {
@@ -547,7 +746,8 @@ fn spawn_backend(command_line: &str, root: &Path) -> Result<tokio::process::Chil
         .stderr(std::process::Stdio::piped());
     #[cfg(target_os = "windows")]
     {
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = command
@@ -589,12 +789,22 @@ pub fn start_site(config: &SiteConfig) -> Result<RunningSite, String> {
     let listener = TcpListener::from_std(std_listener)
         .map_err(|error| format!("Failed to start the listening socket: {error}"))?;
 
-    let (backend, backend_addr) = match config.runtime {
-        Runtime::Static => (None, None),
-        Runtime::Php | Runtime::Node => {
+    let (backend, backend_addr, php_cgi) = match config.runtime {
+        Runtime::Static => (None, None, None),
+        Runtime::Node => {
             let child = spawn_backend(&config.backend_command, &root)?;
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.backend_port);
-            (Some(child), Some(addr))
+            (Some(child), Some(addr), None)
+        }
+        Runtime::Php => {
+            let cgi_path = PathBuf::from(config.backend_command.trim());
+            if !cgi_path.is_file() {
+                return Err(format!(
+                    "php-cgi.exe was not found at: {}",
+                    cgi_path.to_string_lossy()
+                ));
+            }
+            (None, None, Some(cgi_path))
         }
     };
 
@@ -606,6 +816,7 @@ pub fn start_site(config: &SiteConfig) -> Result<RunningSite, String> {
         spa_fallback: config.spa_fallback,
         stats: stats.clone(),
         backend: backend_addr,
+        php_cgi,
     });
     let (shutdown, receiver) = watch::channel(false);
     let task = tokio::spawn(accept_loop(listener, context, receiver));
@@ -893,10 +1104,32 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, context: Arc<Sit
 
         let head_only = request.method == "HEAD";
 
-        // Static hosting never consumes request bodies. Backend runtimes are
-        // handled as a raw byte-for-byte proxy in `proxy_connection`.
-        let keep_alive = request.keep_alive() && !request.has_body;
-        let mut reply = route(&context, &request, &[]).await;
+        // Static sites never read the body (they never needed to); PHP sites
+        // need it verbatim on php-cgi's stdin, so read exactly what the
+        // client declared before routing.
+        let body = if context.php_cgi.is_some() && request.has_body {
+            match read_body(&mut reader, &request).await {
+                Ok(bytes) => bytes,
+                Err(status) => {
+                    let mut reply = Reply::error(status).close();
+                    let _ = write_reply(&mut writer, &mut reply, false, false).await;
+                    context.stats.record(RequestLogEntry {
+                        time: now_millis(),
+                        client: peer.ip().to_string(),
+                        method: sanitize_for_log(&request.method, 16),
+                        path: sanitize_for_log(&request.target, 200),
+                        status,
+                        bytes: 0,
+                    });
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let keep_alive = request.keep_alive() && (context.php_cgi.is_some() || !request.has_body);
+        let mut reply = route(&context, &request, &body).await;
         let close = reply.close || !keep_alive;
         let result = write_reply(&mut writer, &mut reply, head_only, !close).await;
 
@@ -1048,10 +1281,33 @@ async fn read_limited_line(
     Ok(())
 }
 
+const MAX_PHP_BODY_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Reads exactly the declared request body, for PHP sites only. Chunked
 /// bodies aren't decoded (rare for a form post or a JSON fetch() call) and
 /// come back as 501 rather than being guessed at.
-
+async fn read_body(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    request: &Request,
+) -> Result<Vec<u8>, u16> {
+    if request.chunked {
+        return Err(501);
+    }
+    let Some(length) = request.content_length else {
+        return Ok(Vec::new());
+    };
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    if length > MAX_PHP_BODY_BYTES {
+        return Err(413);
+    }
+    let mut buffer = vec![0u8; length as usize];
+    match tokio::time::timeout(REQUEST_TIMEOUT, reader.read_exact(&mut buffer)).await {
+        Ok(Ok(_)) => Ok(buffer),
+        _ => Err(400),
+    }
+}
 
 fn trim_line(line: &[u8]) -> &[u8] {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
@@ -1260,7 +1516,10 @@ async fn timed<T>(
 // Routing
 // ---------------------------------------------------------------------------
 
-async fn route(context: &SiteContext, request: &Request, _body: &[u8]) -> Reply {
+async fn route(context: &SiteContext, request: &Request, body: &[u8]) -> Reply {
+    if let Some(php_cgi) = &context.php_cgi {
+        return route_php(context, request, body, php_cgi).await;
+    }
     match request.method.as_str() {
         "GET" | "HEAD" => {}
         "OPTIONS" => {
@@ -1346,6 +1605,264 @@ async fn route(context: &SiteContext, request: &Request, _body: &[u8]) -> Reply 
             not_found(context, None).await
         }
     }
+}
+
+/// Routing for a PHP site: `.php` files run through php-cgi, exactly like
+/// XAMPP/Apache — everything else in the same folder is still served as a
+/// plain static file, on the same port.
+async fn route_php(context: &SiteContext, request: &Request, body: &[u8], php_cgi: &Path) -> Reply {
+    match request.method.as_str() {
+        "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" => {}
+        "OPTIONS" => {
+            return Reply::new(204).header("Allow", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS");
+        }
+        _ => {
+            return Reply::error(405)
+                .header("Allow", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS")
+                .close();
+        }
+    }
+
+    let target = request.target.as_str();
+    let path_end = target.find(['?', '#']).unwrap_or(target.len());
+    let (raw_path, query) = (&target[..path_end], target[path_end..].trim_start_matches('?'));
+    if !raw_path.starts_with('/') {
+        return Reply::error(400).close();
+    }
+
+    let segments = match decode_segments(raw_path) {
+        Ok(segments) => segments,
+        Err(PathError::BadRequest) => return Reply::error(400).close(),
+        Err(PathError::Forbidden) => return Reply::error(403),
+    };
+
+    let mut candidate = context.root.clone();
+    for segment in &segments {
+        candidate.push(segment);
+    }
+    let last_segment = segments.last().map(String::as_str).unwrap_or("");
+    if is_blocked_for_php(last_segment) {
+        return Reply::error_with(403, "This file type is never served by Website Hosting.");
+    }
+
+    match lookup_for_php(context, &candidate).await {
+        Lookup::Escapes => Reply::error(403),
+        Lookup::File(path) => {
+            if is_php_path(&path) {
+                execute_php(php_cgi, context, request, &path, raw_path, query, body).await
+            } else if matches!(request.method.as_str(), "GET" | "HEAD") {
+                serve_file(request, &path).await
+            } else {
+                Reply::error(405).header("Allow", "GET, HEAD, OPTIONS").close()
+            }
+        }
+        Lookup::Dir(dir) => {
+            if !raw_path.ends_with('/') && !segments.is_empty() {
+                let suffix = if query.is_empty() { String::new() } else { format!("?{query}") };
+                let location = format!("/{}/{}", raw_path.trim_matches('/'), suffix);
+                return Reply::new(301)
+                    .header("Location", location)
+                    .header("Content-Type", "text/html; charset=utf-8");
+            }
+            let mut candidates = Vec::new();
+            if segments.is_empty() {
+                if !context.index_file.is_empty() {
+                    candidates.push(index_path(&context.root, &context.index_file));
+                }
+                candidates.push(context.root.join("index.php"));
+                candidates.push(context.root.join("index.html"));
+                candidates.push(context.root.join("index.htm"));
+            } else {
+                candidates.push(dir.join("index.php"));
+                candidates.push(dir.join("index.html"));
+                candidates.push(dir.join("index.htm"));
+            }
+            for page in candidates {
+                match lookup_for_php(context, &page).await {
+                    Lookup::File(path) if is_php_path(&path) => {
+                        return execute_php(php_cgi, context, request, &path, raw_path, query, body).await;
+                    }
+                    Lookup::File(path) => return serve_file(request, &path).await,
+                    _ => continue,
+                }
+            }
+            not_found(context, None).await
+        }
+        Lookup::Missing => not_found(context, None).await,
+    }
+}
+
+fn is_php_path(path: &Path) -> bool {
+    path.extension()
+        .map(|extension| extension.eq_ignore_ascii_case("php"))
+        .unwrap_or(false)
+}
+
+/// Same rule as `is_blocked_file_name`, except `.php` is exactly what this
+/// route is for, so it's allowed through to `execute_php` instead of being
+/// treated as a leaked script source file.
+fn is_blocked_for_php(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if BLOCKED_FILE_NAMES.contains(&lower.as_str()) {
+        return true;
+    }
+    match lower.rsplit_once('.') {
+        Some((_, "php")) => false,
+        Some((_, extension)) => BLOCKED_EXTENSIONS.contains(&extension),
+        None => false,
+    }
+}
+
+async fn lookup_for_php(context: &SiteContext, candidate: &Path) -> Lookup {
+    let Ok(canonical) = tokio::fs::canonicalize(candidate).await else {
+        return Lookup::Missing;
+    };
+    if !canonical.starts_with(&context.root) {
+        return Lookup::Escapes;
+    }
+    match tokio::fs::metadata(&canonical).await {
+        Ok(metadata) if metadata.is_dir() => Lookup::Dir(canonical),
+        Ok(metadata) if metadata.is_file() => {
+            let name = canonical
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if is_blocked_for_php(&name) {
+                Lookup::Escapes
+            } else {
+                Lookup::File(canonical)
+            }
+        }
+        _ => Lookup::Missing,
+    }
+}
+
+/// Runs one `.php` file through php-cgi (CGI/1.1) and turns its output into
+/// a `Reply`. A fresh process per request — simple and safe, at the cost of
+/// the ~tens-of-milliseconds php-cgi takes to start each time.
+async fn execute_php(
+    php_cgi: &Path,
+    context: &SiteContext,
+    request: &Request,
+    script: &Path,
+    raw_path: &str,
+    query: &str,
+    body: &[u8],
+) -> Reply {
+    let mut command = tokio::process::Command::new(php_cgi);
+    command
+        .current_dir(&context.root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .env("REDIRECT_STATUS", "200")
+        .env("GATEWAY_INTERFACE", "CGI/1.1")
+        .env("SERVER_PROTOCOL", if request.http11 { "HTTP/1.1" } else { "HTTP/1.0" })
+        .env("SERVER_SOFTWARE", SERVER_NAME)
+        .env("SERVER_NAME", "localhost")
+        .env("REQUEST_METHOD", &request.method)
+        .env("SCRIPT_FILENAME", script)
+        .env("SCRIPT_NAME", raw_path)
+        .env("QUERY_STRING", query)
+        .env("DOCUMENT_ROOT", &context.root)
+        .env("REMOTE_ADDR", "127.0.0.1")
+        .env("CONTENT_LENGTH", body.len().to_string());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    for (name, value) in &request.headers {
+        match name.as_str() {
+            "content-type" => {
+                command.env("CONTENT_TYPE", value);
+            }
+            "content-length" => {}
+            _ => {
+                let key = format!("HTTP_{}", name.to_ascii_uppercase().replace('-', "_"));
+                command.env(key, value);
+            }
+        }
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Reply::error_with(500, &format!("Could not start php-cgi: {error}"));
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if !body.is_empty() {
+            let _ = stdin.write_all(body).await;
+        }
+        drop(stdin);
+    }
+
+    match tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await {
+        Ok(Ok(output)) => parse_cgi_output(&output.stdout),
+        Ok(Err(error)) => Reply::error_with(502, &format!("php-cgi failed: {error}")),
+        Err(_) => Reply::error(504),
+    }
+}
+
+/// Splits CGI output into its header block and body, defaulting to 200 when
+/// php-cgi doesn't send a `Status:` line (the normal case).
+fn parse_cgi_output(raw: &[u8]) -> Reply {
+    let mut split = None;
+    for i in 0..raw.len() {
+        if raw[i..].starts_with(b"\r\n\r\n") {
+            split = Some((i, i + 4));
+            break;
+        }
+        if raw[i..].starts_with(b"\n\n") {
+            split = Some((i, i + 2));
+            break;
+        }
+    }
+    let (header_bytes, body_bytes): (&[u8], &[u8]) = match split {
+        Some((end, start)) => (&raw[..end], &raw[start..]),
+        None => (&[], raw),
+    };
+
+    let mut reply = Reply::new(200);
+    let mut status = 200u16;
+    let mut has_content_type = false;
+    for line in String::from_utf8_lossy(header_bytes).split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim().to_string();
+        match name.to_ascii_lowercase().as_str() {
+            "status" => {
+                if let Some(code) = value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|token| token.parse::<u16>().ok())
+                {
+                    status = code;
+                }
+            }
+            "content-length" | "connection" | "transfer-encoding" => {}
+            "content-type" => {
+                has_content_type = true;
+                reply = reply.header("Content-Type", value);
+            }
+            _ => reply = reply.header(name.to_string(), value),
+        }
+    }
+    if !has_content_type {
+        reply = reply.header("Content-Type", "text/html; charset=utf-8");
+    }
+    reply.status = status;
+    reply.body = Body::Bytes(body_bytes.to_vec());
+    reply
 }
 
 async fn not_found(context: &SiteContext, detail: Option<&str>) -> Reply {
@@ -1759,9 +2276,6 @@ mod tests {
             index_file: String::new(),
             spa_fallback: false,
             autostart: false,
-            runtime: Runtime::Static,
-            backend_command: String::new(),
-            backend_port: 0,
         }
     }
 

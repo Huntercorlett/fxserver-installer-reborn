@@ -1,9 +1,12 @@
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::services::website::{self, Exposure, RequestLogEntry, SiteConfig, WebsiteHost};
+use crate::services::{
+    php,
+    website::{self, Exposure, RequestLogEntry, SiteConfig, WebsiteHost},
+};
 
 const SETTINGS_FILE: &str = "website-hosting.json";
 
@@ -215,4 +218,31 @@ pub async fn get_website_requests(
 #[tauri::command]
 pub async fn list_website_pages(root: String) -> Result<Vec<String>, String> {
     super::run_blocking(move || Ok(website::list_html_pages(root.trim().trim_matches('"')))).await
+}
+
+/// XAMPP-style: point this at a folder and get back how to serve it, instead
+/// of the user choosing Static/PHP/Node and hunting down php-cgi.exe.
+#[tauri::command]
+pub async fn detect_website_setup(root: String) -> Result<website::DetectedSiteSetup, String> {
+    super::run_blocking(move || Ok(website::detect_site_setup(&root))).await
+}
+
+/// Whether PHP is already available — either downloaded by this app before,
+/// or found as a manual/system install.
+#[tauri::command]
+pub async fn get_php_status() -> Result<php::PhpStatus, String> {
+    super::run_blocking(|| Ok(php::php_status())).await
+}
+
+/// Downloads and unpacks a portable PHP next to the app itself. No XAMPP, no
+/// admin prompt, no picking a version — just fetches the latest Windows PHP
+/// release and configures it with the extensions a database-backed site needs.
+#[tauri::command]
+pub async fn install_bundled_php(app: AppHandle) -> Result<String, String> {
+    super::run_blocking(move || {
+        php::install_bundled_php(&|stage| {
+            let _ = app.emit("php-install-progress", stage);
+        })
+    })
+    .await
 }

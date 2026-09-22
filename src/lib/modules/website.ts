@@ -1,8 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 export type WebsiteExposure = "local" | "network";
 
-/** "static" serves files as-is. "php"/"node" proxy every request to a backend command. */
+/**
+ * "static" serves files exactly as they are. "php" runs .php files through
+ * php-cgi in the same folder as everything else, like XAMPP/Apache — no
+ * separate process to start, static assets in the same folder still work.
+ * "node" reverse-proxies the whole site to a Node process you start yourself,
+ * since a Node app is its own server rather than a per-file script.
+ */
 export type WebsiteRuntime = "static" | "php" | "node";
 
 export interface WebsiteSiteConfig {
@@ -17,9 +24,13 @@ export interface WebsiteSiteConfig {
 	spaFallback: boolean;
 	autostart: boolean;
 	runtime: WebsiteRuntime;
-	/** Command that starts the backend, run from the website folder. Ignored for "static". */
+	/**
+	 * runtime "php": full path to php-cgi.exe.
+	 * runtime "node": the command that starts the Node app, run from the website folder.
+	 * runtime "static": unused.
+	 */
 	backendCommand: string;
-	/** Port the backend command listens on internally. Ignored for "static". */
+	/** runtime "node" only: the port the Node app listens on internally. */
 	backendPort: number;
 }
 
@@ -48,23 +59,19 @@ export function emptyWebsiteSite(): WebsiteSiteConfig {
 	return { id: "", name: "", root: "", indexFile: "", port: 8080, exposure: "local", spaFallback: false, autostart: false, runtime: "static", backendCommand: "", backendPort: 0 };
 }
 
-const backendExamples: Record<Exclude<WebsiteRuntime, "static">, string> = {
-	php: "php -S 127.0.0.1:8901 -t .",
-	node: "node server.js",
-};
-
-export function backendCommandExample(runtime: WebsiteRuntime) {
-	return runtime === "static" ? "" : backendExamples[runtime];
-}
+export const nodeCommandExample = "node server.js";
 
 /** Returns a user-facing problem with the form values, or an empty string. */
 export function validateWebsiteSite(site: WebsiteSiteConfig): string {
 	if (!site.name.trim()) return "Enter a name for the website.";
 	if (!site.root.trim()) return "Choose the folder that contains the website files.";
 	if (!Number.isInteger(site.port) || site.port < 1 || site.port > 65535) return "Enter a port between 1 and 65535.";
-	if (site.runtime !== "static") {
-		if (!site.backendCommand.trim()) return "Enter the command that starts the PHP or Node app.";
-		if (!Number.isInteger(site.backendPort) || site.backendPort < 1 || site.backendPort > 65535) return "Enter the port the PHP or Node app listens on.";
+	if (site.runtime === "php") {
+		// Empty is fine here — the backend auto-locates php-cgi.exe (XAMPP-style)
+		// when this is left blank, and reports it clearly if none is found.
+	} else if (site.runtime === "node") {
+		if (!site.backendCommand.trim()) return "Enter the command that starts the Node app.";
+		if (!Number.isInteger(site.backendPort) || site.backendPort < 1 || site.backendPort > 65535) return "Enter the port the Node app listens on.";
 		if (site.backendPort === site.port) return "The backend port must be different from the website port above it.";
 	}
 	return "";
@@ -93,3 +100,33 @@ export const startWebsiteSite = (id: string) => invoke<WebsiteSiteStatus[]>("sta
 export const stopWebsiteSite = (id: string) => invoke<WebsiteSiteStatus[]>("stop_website_site", { id });
 export const getWebsiteRequests = (id: string) => invoke<WebsiteRequestEntry[]>("get_website_requests", { id });
 export const listWebsitePages = (root: string) => invoke<string[]>("list_website_pages", { root });
+
+export interface DetectedWebsiteSetup {
+	runtime: WebsiteRuntime;
+	phpCgiPath: string | null;
+	nodeCommand: string | null;
+	message: string;
+}
+
+/** XAMPP-style folder detection: what to run, without asking the user to pick. */
+export const detectWebsiteSetup = (root: string) => invoke<DetectedWebsiteSetup>("detect_website_setup", { root });
+
+export interface PhpStatus {
+	bundledPath: string | null;
+	systemPath: string | null;
+}
+
+export const getPhpStatus = () => invoke<PhpStatus>("get_php_status");
+
+/** Downloads a portable PHP next to the app itself — no XAMPP, no system install, no version picking. */
+export async function installBundledPhp(onProgress?: (stage: string) => void): Promise<string> {
+	let unlisten: (() => void) | undefined;
+	try {
+		if (onProgress) {
+			unlisten = await listen<string>("php-install-progress", ({ payload }) => onProgress(payload));
+		}
+		return await invoke<string>("install_bundled_php");
+	} finally {
+		unlisten?.();
+	}
+}
